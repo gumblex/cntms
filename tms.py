@@ -15,7 +15,7 @@ import prcoords
 import tornado.web
 import tornado.gen
 import tornado.ioloop
-import tornado.httpclient
+import tornado.curl_httpclient
 from PIL import Image
 
 # Earth mean radius
@@ -113,6 +113,8 @@ def load_config():
     cfg['port'] = int(cfg['port'])
     cfg['cache_size'] = int(cfg['cache_size'])
     cfg['cache_ttl'] = int(cfg['cache_ttl'])
+    if 'proxy_port' in cfg:
+        cfg['proxy_port'] = int(cfg['proxy_port'])
     CONFIG = cfg
     TILE_SOURCE_CACHE = TileCache(cfg['cache_db'], cfg['cache_size'], cfg['cache_ttl'])
 
@@ -198,8 +200,10 @@ def get_tile(source, z, x, y, retina=False, client_headers=None):
         headers = {k:v for k,v in client_headers.items() if k in HEADERS_WHITELIST}
     else:
         headers = None
-    client = tornado.httpclient.AsyncHTTPClient()
-    response = yield client.fetch(url, headers=headers, connect_timeout=20)
+    client = tornado.curl_httpclient.CurlAsyncHTTPClient()
+    response = yield client.fetch(
+        url, headers=headers, connect_timeout=20,
+        proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'))
     res = (response.body, response.headers['Content-Type'])
     TILE_SOURCE_CACHE[cache_key] = res
     return res
