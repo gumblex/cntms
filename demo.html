@@ -83,7 +83,8 @@ L.control.layers(layers_base, layers_overlay).addTo(map);
 function setHash() {
     var a = map.getCenter(), z = map.getZoom();
     var i = Math.max(0, Math.ceil(Math.log(z) / Math.LN2));
-    window.location.hash = "#" + z + "/" + a.lat.toFixed(i) + "/" + a.lng.toFixed(i);
+    history.replaceState(undefined, undefined,
+        "#" + z + "/" + a.lat.toFixed(i) + "/" + a.lng.toFixed(i));
 }
 map.on('zoomend', setHash);
 map.on('moveend', setHash);
