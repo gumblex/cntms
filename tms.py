@@ -191,7 +191,6 @@ def get_tile(source, z, x, y, retina=False, client_headers=None):
     url = api['url2x' if retina else 'url'].format(
         s=(random.choice(api['s']) if 's' in api else ''),
         x=x, y=y, z=z, x4=(x>>4), y4=(y>>4))
-    print(url)
     if client_headers:
         headers = {k:v for k,v in client_headers.items() if k in HEADERS_WHITELIST}
     else:
@@ -213,11 +212,9 @@ def draw_tile(source, z, x, y, retina=False, client_headers=None):
         realxy = OFFSET_FN[api['offset']](x, y, z)
         sgnxy = OFFSET_SGN[api['offset']]
         futures = []
-        print(source, realxy)
         for dx1, dy1 in CORNERS:
             x1 = math.floor(realxy[0]) + dx1
             y1 = math.floor(realxy[1]) + dy1
-            print(source, z, x1, y1)
             futures.append(get_tile(source, z, x1, y1, retina, client_headers))
         tiles = yield futures
         return stitch_tiles(tiles, realxy[0], realxy[1], sgnxy, source)
