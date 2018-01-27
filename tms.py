@@ -242,6 +242,12 @@ class TestHandler(tornado.web.RequestHandler):
                 if 'url2x' in APIS[s])) for tile in TEST_TILES))
         self.write(html)
 
+class RobotsTxtHandler(tornado.web.RequestHandler):
+    def get(self):
+        txt = 'User-agent: *\nDisallow: /\n'
+        self.set_header('Content-Type', 'text/plain; charset=UTF-8')
+        self.write(txt)
+
 class DemoHandler(tornado.web.RequestHandler):
     def get(self):
         layers_base = []
@@ -262,7 +268,6 @@ class DemoHandler(tornado.web.RequestHandler):
         self.write(html)
 
 class TMSHandler(tornado.web.RequestHandler):
-
     def initialize(self, *args, **kwargs):
         self.headers = self.request.headers
 
@@ -289,6 +294,7 @@ def make_app():
         (r"/test", TestHandler),
         (r"/map", DemoHandler),
         (r"/([^/]+)/(\d+)/(-?\d+)/(-?\d+)((?:@2x)?)", TMSHandler),
+        (r"/robots.txt", RobotsTxtHandler),
     ])
 
 if __name__ == '__main__':
