@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>TMS Demo</title>
+<style>
+html, body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+}
+body {
+    font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Oxygen-Sans,Ubuntu,Cantarell,"Helvetica Neue",sans-serif;
+    font-size: 15px;
+    line-height: 1.25em;
+}
+a {
+    color: #425e5e;
+    padding: .25em;
+}
+a:visited {
+    color: #233;
+}
+a:hover, a:focus {
+    color: #4e7a7a;
+}
+section {
+    background-color: white;
+    word-wrap: break-word;
+    box-sizing: border-box;
+    transition: all .1s;
+}
+p {
+    margin: .5em 0;
+}
+#container {
+    height: 100%;
+    width: auto;
+}
+#agent {
+    width: 250px;
+    height: 100%;
+    float: left;
+    padding: 15px 20px;
+    overflow-y: auto;
+}
+#mapwrap, #map {
+    height: 100%;
+    width: 100%;
+}
+</style>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.3.1/leaflet.css" integrity="sha256-iYUgmrapfDGvBrePJPrMWQZDcObdAcStKBpjP3Az+3s=" crossorigin="anonymous">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.3.1/leaflet-src.js" integrity="sha256-RTChoCC1wuQGp8CspWGklot1/MimjntlaEIMAONjJ+0=" crossorigin="anonymous"></script>
+<script>
+'use strict';
+document.addEventListener('DOMContentLoaded', function() {
+var map;
+var layers_attr = {{layers}};
+document.getElementById('map').innerHTML = "";
+map = L.map('map', {center: [39.9276, 116.3789], zoom: 3});
+var layers_base = {}, layers_overlay = {};
+var i = 0;
+for (i = 0; i < layers_attr[0].length; i++) {
+    var obj = layers_attr[0][i];
+    layers_base[obj['name']] = L.tileLayer(obj['url'],
+        {id: obj['id'], attribution: obj['attribution'], maxZoom: 18, minZoom: 3});
+    if (i == 0) layers_base[obj['name']].addTo(map);
+}
+for (i = 0; i < layers_attr[1].length; i++) {
+    var obj = layers_attr[1][i];
+    layers_overlay[obj['name']] = L.tileLayer(obj['url'],
+        {id: obj['id'], attribution: obj['attribution'], maxZoom: 18, minZoom: 3});
+}
+L.control.layers(layers_base, layers_overlay).addTo(map);
+});
+</script>
+</head>
+<body>
+<div id="container">
+<section id="mapwrap" class="smooth">
+<div id="map">The map is not loaded.</div>
+</section>
+</div>
+</body>
+</html>

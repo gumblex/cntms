@@ -4,6 +4,7 @@
 import io
 import time
 import math
+import json
 import random
 import sqlite3
 import warnings
@@ -23,6 +24,9 @@ EARTH_EQUATORIAL_RADIUS = 6378137
 
 CONFIG_FILE = 'tmsapi.ini'
 CACHE_DB = 'tmscache.db'
+# ~ 14KB per row
+CACHE_SIZE = 1024 * 5
+CACHE_TTL = 86400
 APIS = None
 
 
@@ -81,7 +85,7 @@ class TileCache(collections.abc.MutableMapping):
     def expire(self, etime=None):
         """Remove expired items from the cache."""
         self.db.execute('DELETE FROM cache WHERE key NOT IN ('
-            'SELECT key FROM cache WHERE expire>=? ORDER BY updated LIMIT ?)',
+            'SELECT key FROM cache WHERE expire>=? ORDER BY updated DESC LIMIT ?)',
             (etime or time.time(), self.maxsize))
 
     def clear(self):
@@ -93,7 +97,7 @@ class TileCache(collections.abc.MutableMapping):
         except KeyError:
             return default
 
-TILE_SOURCE_CACHE = TileCache(CACHE_DB, 256, 86400)
+TILE_SOURCE_CACHE = TileCache(CACHE_DB, CACHE_SIZE, CACHE_TTL)
 
 def load_config():
     global APIS
@@ -124,6 +128,8 @@ def deg2num(lat, lon, zoom):
     return (xtile, ytile)
 
 def offset_gcj(x, y, z):
+    if z < 8:
+        return (x, y)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         realpos = prcoords.wgs_gcj(num2deg(x, y, z), True)
@@ -131,28 +137,39 @@ def offset_gcj(x, y, z):
         return realxy
 
 def offset_qq(x, y, z):
+    if z < 8:
+        return (x, 2**z - 2 - y)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         realpos = prcoords.wgs_gcj(num2deg(x, y, z), True)
         realx, realy = deg2num(zoom=z, *realpos)
-        return (realx, (2**z - 1 - realy))
+        return (realx, 2**z - 1 - realy)
 
 OFFSET_FN = {
     'gcj': offset_gcj,
     'qq': offset_qq
 }
+OFFSET_SGN = {
+    'gcj': (1, 1),
+    'qq': (1, -1)
+}
 
-def stitch_tiles(tiles, x, y, name):
-    xfrac = x - math.floor(x)
-    yfrac = y - math.floor(y)
+def stitch_tiles(tiles, x, y, sgnxy, name):
+    xfrac = x - math.floor(x) if sgnxy[0] == 1 else math.ceil(x) - x
+    yfrac = y - math.floor(y) if sgnxy[1] == 1 else math.ceil(y) - y
     ims = [Image.open(io.BytesIO(b)) for b, _ in tiles]
     size = ims[0].size
-    if ims[0].format == 'PNG':
+    if ims[0].mode in ('P', 'RGBA'):
         mode = 'RGBA'
     else:
         mode = 'RGB'
     newim = Image.new(mode, (size[0]*2, size[1]*2))
-    for i, dxy in enumerate(CORNERS):
+    if sgnxy == (1, 1):
+        corners = CORNERS
+    else:
+        corners = tuple((x*sgnxy[0] + (sgnxy[0]==-1), y*sgnxy[1] + (sgnxy[1]==-1))
+                         for x, y in CORNERS)
+    for i, dxy in enumerate(corners):
         newim.paste(ims[i], (size[0]*dxy[0], size[1]*dxy[1]))
     x2 = round(size[0]*xfrac)
     y2 = round(size[1]*yfrac)
@@ -165,54 +182,83 @@ def stitch_tiles(tiles, x, y, name):
     return retb.getvalue(), tiles[0][1]
 
 @tornado.gen.coroutine
-def get_tile(source, z, x, y, client_headers=None):
-    cache_key = '%s/%d/%d/%d' % (source, z, x, y)
+def get_tile(source, z, x, y, retina=False, client_headers=None):
+    api = APIS[source]
+    cache_key = '%s%s/%d/%d/%d' % (source, '@2x' if retina else '', z, x, y)
     res = TILE_SOURCE_CACHE.get(cache_key)
     if res:
         return res
-    api = APIS[source]
-    url = api['url'].format(s=(random.choice(api['s']) if 's' in api else ''),
+    url = api['url2x' if retina else 'url'].format(
+        s=(random.choice(api['s']) if 's' in api else ''),
         x=x, y=y, z=z, x4=(x>>4), y4=(y>>4))
+    print(url)
     if client_headers:
         headers = {k:v for k,v in client_headers.items() if k in HEADERS_WHITELIST}
     else:
         headers = None
     client = tornado.httpclient.AsyncHTTPClient()
-    response = yield client.fetch(url, headers=headers, connect_timeout=10)
+    response = yield client.fetch(url, headers=headers, connect_timeout=20)
     res = (response.body, response.headers['Content-Type'])
     TILE_SOURCE_CACHE[cache_key] = res
     return res
 
 @tornado.gen.coroutine
-def draw_tile(source, z, x, y, client_headers=None):
+def draw_tile(source, z, x, y, retina=False, client_headers=None):
     api = APIS[source]
-    if z < 8 or 'offset' not in api:
-        res = yield get_tile(source, z, x, y, client_headers)
+    retina = ('url2x' in api and retina)
+    if 'offset' not in api or (z < 8 and OFFSET_SGN[api['offset']] == (1, 1)):
+        res = yield get_tile(source, z, x, y, retina, client_headers)
         return res
     else:
         realxy = OFFSET_FN[api['offset']](x, y, z)
+        sgnxy = OFFSET_SGN[api['offset']]
         futures = []
+        print(source, realxy)
         for dx1, dy1 in CORNERS:
             x1 = math.floor(realxy[0]) + dx1
             y1 = math.floor(realxy[1]) + dy1
-            futures.append(get_tile(source, z, x1, y1, client_headers))
+            print(source, z, x1, y1)
+            futures.append(get_tile(source, z, x1, y1, retina, client_headers))
         tiles = yield futures
-        return stitch_tiles(tiles, realxy[0], realxy[1], source)
+        return stitch_tiles(tiles, realxy[0], realxy[1], sgnxy, source)
 
 
 class MainHandler(tornado.web.RequestHandler):
     def get(self):
         html = ('<!DOCTYPE html><html><head><title>TMS Tile Proxy Server</title>'
-                '</head><body><p>Endpoints:</p><ul>%s</ul></body></html>') % ''.join(
-                '<li>/%s/[z]/[x]/[y]</li>' % s for s in APIS)
+                '</head><body><p>Endpoints:</p><ul>%s</ul>'
+                '<p><a href="/map">Demo</a></p></body></html>') % ''.join(
+                '<li>/%s/{z}/{x}/{y}%s</li>' % (
+                s, '{@2x}' if 'url2x' in APIS[s] else '') for s in APIS)
         self.write(html)
 
 class TestHandler(tornado.web.RequestHandler):
     def get(self):
-        TEST_TILE = '14/13518/6396'
+        TEST_TILES = ('14/13518/6396', '4/14/8', '8/203/132')
         html = ('<!DOCTYPE html><html><head><title>TMS Tile Proxy Server</title>'
-                '</head><body><p>%s</p></body></html>') % ''.join(
-                '<img src="/%s/%s" title="%s">' % (s, TEST_TILE, s) for s in APIS)
+                '</head><body>%s</body></html>' % ''.join('<p>%s</p><p>%s</p>' % (
+                ''.join('<img src="/%s/%s" title="%s">' % (s, tile, s) for s in APIS),
+                ''.join('<img src="/%s/%s@2x" title="%s">' % (s, tile, s) for s in APIS
+                if 'url2x' in APIS[s])) for tile in TEST_TILES))
+        self.write(html)
+
+class DemoHandler(tornado.web.RequestHandler):
+    def get(self):
+        layers_base = []
+        layers_overlay = []
+        for k, v in APIS.items():
+            obj = {'url': '/%s/{z}/{x}/{y}%s' % (k, '{r}' if 'url2x' in v else ''),
+                   'name': v.get('name', k),
+                   'attribution': v.get('attribution', '')}
+            if 'url2x' in v:
+                obj['url2x'] = v['url2x']
+            if 'annotation' in v:
+                layers_overlay.append(obj)
+            else:
+                layers_base.append(obj)
+        layers_attr = json.dumps([layers_base, layers_overlay], separators=(',', ':'))
+        with open('demo.html', 'r', encoding='utf-8') as f:
+            html = f.read().replace('{{layers}}', layers_attr)
         self.write(html)
 
 class TMSHandler(tornado.web.RequestHandler):
@@ -221,9 +267,10 @@ class TMSHandler(tornado.web.RequestHandler):
         self.headers = self.request.headers
 
     @tornado.gen.coroutine
-    def get(self, name, z, x, y):
+    def get(self, name, z, x, y, retina):
         try:
-            res = yield draw_tile(name, int(z), int(x), int(y), self.request.headers)
+            res = yield draw_tile(
+                name, int(z), int(x), int(y), bool(retina), self.request.headers)
         except tornado.httpclient.HTTPError as ex:
             if ex.code == 404:
                 raise tornado.web.HTTPError(404)
@@ -232,7 +279,7 @@ class TMSHandler(tornado.web.RequestHandler):
         except Exception:
             raise
         self.set_header('Content-Type', res[1])
-        self.set_header('Cache-Control', 'max-age=86400')
+        self.set_header('Cache-Control', 'max-age=%d' % CACHE_TTL)
         self.write(res[0])
 
 def make_app():
@@ -240,7 +287,8 @@ def make_app():
     return tornado.web.Application([
         (r"/", MainHandler),
         (r"/test", TestHandler),
-        (r"/([^/]+)/(\d+)/(-?\d+)/(-?\d+)", TMSHandler),
+        (r"/map", DemoHandler),
+        (r"/([^/]+)/(\d+)/(-?\d+)/(-?\d+)((?:@2x)?)", TMSHandler),
     ])
 
 if __name__ == '__main__':
