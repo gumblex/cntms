@@ -23,12 +23,8 @@ R_EARTH = 6371000
 EARTH_EQUATORIAL_RADIUS = 6378137
 
 CONFIG_FILE = 'tmsapi.ini'
-CACHE_DB = 'tmscache.db'
-# ~ 14KB per row
-CACHE_SIZE = 1024 * 5
-CACHE_TTL = 86400
+CONFIG = {}
 APIS = None
-
 
 CORNERS = ((0, 0), (0, 1), (1, 0), (1, 1))
 
@@ -97,22 +93,28 @@ class TileCache(collections.abc.MutableMapping):
         except KeyError:
             return default
 
-TILE_SOURCE_CACHE = TileCache(CACHE_DB, CACHE_SIZE, CACHE_TTL)
+TILE_SOURCE_CACHE = {}
 
 def load_config():
-    global APIS
+    global APIS, TILE_SOURCE_CACHE, CONFIG
     if APIS:
         return
     config = configparser.ConfigParser(interpolation=None)
     config.read(CONFIG_FILE)
     APIS = {}
     for name, cfgsection in config.items():
-        if name == 'DEFAULT':
+        if name in ('DEFAULT', 'CONFIG'):
             continue
         section = dict(cfgsection)
         if 's' in section:
             section['s'] = section['s'].split(',')
         APIS[name] = section
+    cfg = dict(config['CONFIG'])
+    cfg['port'] = int(cfg['port'])
+    cfg['cache_size'] = int(cfg['cache_size'])
+    cfg['cache_ttl'] = int(cfg['cache_ttl'])
+    CONFIG = cfg
+    TILE_SOURCE_CACHE = TileCache(cfg['cache_db'], cfg['cache_size'], cfg['cache_ttl'])
 
 def num2deg(xtile, ytile, zoom):
     n = 2 ** zoom
@@ -139,6 +141,7 @@ def offset_gcj(x, y, z):
 def offset_qq(x, y, z):
     if z < 8:
         return (x, 2**z - 2 - y)
+    # has some problems outside China at z=8
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         realpos = prcoords.wgs_gcj(num2deg(x, y, z), True)
@@ -231,7 +234,7 @@ class MainHandler(tornado.web.RequestHandler):
 
 class TestHandler(tornado.web.RequestHandler):
     def get(self):
-        TEST_TILES = ('14/13518/6396', '4/14/8', '8/203/132')
+        TEST_TILES = ('14/13518/6396', '4/14/8', '8/203/132', '9/430/240')
         html = ('<!DOCTYPE html><html><head><title>TMS Tile Proxy Server</title>'
                 '</head><body>%s</body></html>' % ''.join('<p>%s</p><p>%s</p>' % (
                 ''.join('<img src="/%s/%s" title="%s">' % (s, tile, s) for s in APIS),
@@ -276,7 +279,7 @@ class TMSHandler(tornado.web.RequestHandler):
         except Exception:
             raise
         self.set_header('Content-Type', res[1])
-        self.set_header('Cache-Control', 'max-age=%d' % CACHE_TTL)
+        self.set_header('Cache-Control', 'max-age=%d' % CONFIG['cache_ttl'])
         self.write(res[0])
 
 def make_app():
@@ -290,5 +293,5 @@ def make_app():
 
 if __name__ == '__main__':
     app = make_app()
-    app.listen(6700)
+    app.listen(CONFIG['port'], CONFIG['listen'])
     tornado.ioloop.IOLoop.current().start()

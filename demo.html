@@ -55,10 +55,17 @@ p {
 <script>
 'use strict';
 document.addEventListener('DOMContentLoaded', function() {
-var map;
 var layers_attr = {{layers}};
 document.getElementById('map').innerHTML = "";
-map = L.map('map', {center: [39.9276, 116.3789], zoom: 3});
+var zoom = 3, lat = 39.9276, lng = 116.3789;
+if (window.location.hash) {
+    var h = window.location.hash.substring(1).split('/');
+    var z = parseInt(h[0], 10), l1 = parseFloat(h[1]), l2 = parseFloat(h[2]);
+    if (!(isNaN(z) || isNaN(l1) || isNaN(l2))) {
+        zoom = z; lat = l1; lng = l2;
+    }
+}
+var map = L.map('map', {center: [lat, lng], zoom: zoom});
 var layers_base = {}, layers_overlay = {};
 var i = 0;
 for (i = 0; i < layers_attr[0].length; i++) {
@@ -73,6 +80,13 @@ for (i = 0; i < layers_attr[1].length; i++) {
         {id: obj['id'], attribution: obj['attribution'], maxZoom: 18, minZoom: 3});
 }
 L.control.layers(layers_base, layers_overlay).addTo(map);
+function setHash() {
+    var a = map.getCenter(), z = map.getZoom();
+    var i = Math.max(0, Math.ceil(Math.log(z) / Math.LN2));
+    window.location.hash = "#" + z + "/" + a.lat.toFixed(i) + "/" + a.lng.toFixed(i);
+}
+map.on('zoomend', setHash);
+map.on('moveend', setHash);
 });
 </script>
 </head>
