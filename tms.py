@@ -232,7 +232,7 @@ class MainHandler(tornado.web.RequestHandler):
         html = ('<!DOCTYPE html><html><head><title>TMS Tile Proxy Server</title>'
                 '</head><body><p>Endpoints:</p><ul>%s</ul>'
                 '<p><a href="/map">Demo</a></p></body></html>') % ''.join(
-                '<li>/%s/{z}/{x}/{y}%s</li>' % (
+                '<li>%s: /%s/{z}/{x}/{y}%s</li>' % (APIS[s].get('name', s),
                 s, '{@2x}' if 'url2x' in APIS[s] else '') for s in APIS)
         self.write(html)
 
