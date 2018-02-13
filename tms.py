@@ -184,6 +184,9 @@ def stitch_tiles(tiles, x, y, sgnxy, name):
         retim.save(retb, 'JPEG', quality=92)
     else:
         retim.save(retb, ims[0].format)
+    newim.close()
+    retim.close()
+    [i.close() for i in ims]
     return retb.getvalue(), tiles[0][1]
 
 @tornado.gen.coroutine
@@ -206,6 +209,7 @@ def get_tile(source, z, x, y, retina=False, client_headers=None):
         proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'))
     res = (response.body, response.headers['Content-Type'])
     TILE_SOURCE_CACHE[cache_key] = res
+    client.close()
     return res
 
 @tornado.gen.coroutine
