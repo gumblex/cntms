@@ -29,6 +29,7 @@ APIS = None
 CORNERS = ((0, 0), (0, 1), (1, 0), (1, 1))
 
 HEADERS_WHITELIST = {'User-Agent', 'Accept', 'Accept-Language'}
+HTTP_CLIENT = tornado.curl_httpclient.CurlAsyncHTTPClient()
 
 class TileCache(collections.abc.MutableMapping):
 
@@ -203,13 +204,11 @@ def get_tile(source, z, x, y, retina=False, client_headers=None):
         headers = {k:v for k,v in client_headers.items() if k in HEADERS_WHITELIST}
     else:
         headers = None
-    client = tornado.curl_httpclient.CurlAsyncHTTPClient()
-    response = yield client.fetch(
+    response = yield HTTP_CLIENT.fetch(
         url, headers=headers, connect_timeout=20,
         proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'))
     res = (response.body, response.headers['Content-Type'])
     TILE_SOURCE_CACHE[cache_key] = res
-    client.close()
     return res
 
 @tornado.gen.coroutine
