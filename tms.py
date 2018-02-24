@@ -134,12 +134,12 @@ def deg2num(lat, lon, zoom):
 
 def offset_gcj(x, y, z):
     if z < 8:
-        return (x, y)
+        return (x, y, z)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         realpos = prcoords.wgs_gcj(num2deg(x, y, z), True)
-        realxy = deg2num(zoom=z, *realpos)
-        return realxy
+        realx, realy = deg2num(zoom=z, *realpos)
+        return (realx, realy, z)
 
 def offset_qq(x, y, z):
     if z < 8:
@@ -149,15 +149,45 @@ def offset_qq(x, y, z):
         warnings.simplefilter("ignore")
         realpos = prcoords.wgs_gcj(num2deg(x, y, z), True)
         realx, realy = deg2num(zoom=z, *realpos)
-        return (realx, 2**z - 1 - realy)
+        return (realx, 2**z - 1 - realy, z)
+
+BD_LL2MC = (
+    (-0.0015702102444, 111320.7020616939, 1704480524535203, -10338987376042340, 26112667856603880, -35149669176653700, 26595700718403920, -10725012454188240, 1800819912950474, 82.5),
+    (0.0008277824516172526, 111320.7020463578, 647795574.6671607, -4082003173.641316, 10774905663.51142, -15171875531.51559, 12053065338.62167, -5124939663.577472, 913311935.9512032, 67.5),
+    (0.00337398766765, 111320.7020202162, 4481351.045890365, -23393751.19931662, 79682215.47186455, -115964993.2797253, 97236711.15602145, -43661946.33752821, 8477230.501135234, 52.5),
+    (0.00220636496208, 111320.7020209128, 51751.86112841131, 3796837.749470245, 992013.7397791013, -1221952.21711287, 1340652.697009075, -620943.6990984312, 144416.9293806241, 37.5),
+    (-0.0003441963504368392, 111320.7020576856, 278.2353980772752, 2485758.690035394, 6070.750963243378, 54821.18345352118, 9540.606633304236, -2710.55326746645, 1405.483844121726, 22.5),
+    (-0.0003218135878613132, 111320.7020701615, 0.00369383431289, 823725.6402795718, 0.46104986909093, 2351.343141331292, 1.58060784298199, 8.77738589078284, 0.37238884252424, 7.45)
+)
+
+def offset_bd(x, y, z):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        realpos = prcoords.wgs_gcj(num2deg(x, y, z), True)
+    z += 1
+    for i, Kj_d in enumerate(range(75, -15, -15)):
+        if abs(realpos.lat) >= Kj_d:
+            mc = BD_LL2MC[i]
+    lng = mc[0] + mc[1] * abs(realpos.lon)
+    c = abs(realpos.lat) / mc[9]
+    lat = mc[2] + mc[3] * c + mc[4] * c * c + mc[5] * c**3 + mc[6] * c**4 + mc[7] * c**5 + mc[8] * c**6
+    lng = math.copysign(lng, realpos.lon)
+    lat = math.copysign(lat, realpos.lat)
+    x = lng * 2 ** (z - 18 - 8)
+    y = y0 = lat * 2 ** (z - 18 - 8)
+    #yf = math.floor(y0)
+    #y = yf + 1 - (y0 - yf)
+    return (x, y, z)
 
 OFFSET_FN = {
     'gcj': offset_gcj,
-    'qq': offset_qq
+    'qq': offset_qq,
+    'bd': offset_bd
 }
 OFFSET_SGN = {
     'gcj': (1, 1),
-    'qq': (1, -1)
+    'qq': (1, -1),
+    'bd': (1, -1)
 }
 
 def stitch_tiles(tiles, x, y, sgnxy, name):
@@ -199,7 +229,8 @@ def get_tile(source, z, x, y, retina=False, client_headers=None):
         return res
     url = api['url2x' if retina else 'url'].format(
         s=(random.choice(api['s']) if 's' in api else ''),
-        x=x, y=y, z=z, x4=(x>>4), y4=(y>>4))
+        x=x, y=y, z=z, x4=(x>>4), y4=(y>>4),
+        xm=str(x).replace('-', 'M'), ym=str(y).replace('-', 'M'))
     if client_headers:
         headers = {k:v for k,v in client_headers.items() if k in HEADERS_WHITELIST}
     else:
@@ -219,15 +250,16 @@ def draw_tile(source, z, x, y, retina=False, client_headers=None):
         res = yield get_tile(source, z, x, y, retina, client_headers)
         return res
     else:
-        realxy = OFFSET_FN[api['offset']](x, y, z)
+        realxyz = OFFSET_FN[api['offset']](x, y, z)
         sgnxy = OFFSET_SGN[api['offset']]
         futures = []
         for dx1, dy1 in CORNERS:
-            x1 = math.floor(realxy[0]) + dx1
-            y1 = math.floor(realxy[1]) + dy1
-            futures.append(get_tile(source, z, x1, y1, retina, client_headers))
+            x1 = math.floor(realxyz[0]) + dx1
+            y1 = math.floor(realxyz[1]) + dy1
+            futures.append(get_tile(
+                source, realxyz[2], x1, y1, retina, client_headers))
         tiles = yield futures
-        return stitch_tiles(tiles, realxy[0], realxy[1], sgnxy, source)
+        return stitch_tiles(tiles, realxyz[0], realxyz[1], sgnxy, source)
 
 
 class MainHandler(tornado.web.RequestHandler):
