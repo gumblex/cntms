@@ -8,6 +8,7 @@ import json
 import random
 import sqlite3
 import warnings
+import itertools
 import collections
 import configparser
 
@@ -16,7 +17,7 @@ import tornado.web
 import tornado.gen
 import tornado.ioloop
 import tornado.curl_httpclient
-from PIL import Image
+from PIL import Image, ImageDraw
 
 # Earth mean radius
 R_EARTH = 6371000
@@ -26,7 +27,14 @@ CONFIG_FILE = 'tmsapi.ini'
 CONFIG = {}
 APIS = None
 
-CORNERS = ((0, 0), (0, 1), (1, 0), (1, 1))
+BD_LL2MC = (
+    (-0.0015702102444, 111320.7020616939, 1704480524535203, -10338987376042340, 26112667856603880, -35149669176653700, 26595700718403920, -10725012454188240, 1800819912950474, 82.5),
+    (0.0008277824516172526, 111320.7020463578, 647795574.6671607, -4082003173.641316, 10774905663.51142, -15171875531.51559, 12053065338.62167, -5124939663.577472, 913311935.9512032, 67.5),
+    (0.00337398766765, 111320.7020202162, 4481351.045890365, -23393751.19931662, 79682215.47186455, -115964993.2797253, 97236711.15602145, -43661946.33752821, 8477230.501135234, 52.5),
+    (0.00220636496208, 111320.7020209128, 51751.86112841131, 3796837.749470245, 992013.7397791013, -1221952.21711287, 1340652.697009075, -620943.6990984312, 144416.9293806241, 37.5),
+    (-0.0003441963504368392, 111320.7020576856, 278.2353980772752, 2485758.690035394, 6070.750963243378, 54821.18345352118, 9540.606633304236, -2710.55326746645, 1405.483844121726, 22.5),
+    (-0.0003218135878613132, 111320.7020701615, 0.00369383431289, 823725.6402795718, 0.46104986909093, 2351.343141331292, 1.58060784298199, 8.77738589078284, 0.37238884252424, 7.45)
+)
 
 HEADERS_WHITELIST = {'User-Agent', 'Accept', 'Accept-Language'}
 HTTP_CLIENT = tornado.curl_httpclient.CurlAsyncHTTPClient()
@@ -143,40 +151,29 @@ def offset_gcj(x, y, z):
 
 def offset_qq(x, y, z):
     if z < 8:
-        return (x, 2**z - 2 - y)
-    # has some problems outside China at z=8
+        return (x, 2**z - 1 - y, z)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        realpos = prcoords.wgs_gcj(num2deg(x, y, z), True)
+        realpos = prcoords.wgs_gcj(num2deg(x, y+1, z), True)
         realx, realy = deg2num(zoom=z, *realpos)
-        return (realx, 2**z - 1 - realy, z)
-
-BD_LL2MC = (
-    (-0.0015702102444, 111320.7020616939, 1704480524535203, -10338987376042340, 26112667856603880, -35149669176653700, 26595700718403920, -10725012454188240, 1800819912950474, 82.5),
-    (0.0008277824516172526, 111320.7020463578, 647795574.6671607, -4082003173.641316, 10774905663.51142, -15171875531.51559, 12053065338.62167, -5124939663.577472, 913311935.9512032, 67.5),
-    (0.00337398766765, 111320.7020202162, 4481351.045890365, -23393751.19931662, 79682215.47186455, -115964993.2797253, 97236711.15602145, -43661946.33752821, 8477230.501135234, 52.5),
-    (0.00220636496208, 111320.7020209128, 51751.86112841131, 3796837.749470245, 992013.7397791013, -1221952.21711287, 1340652.697009075, -620943.6990984312, 144416.9293806241, 37.5),
-    (-0.0003441963504368392, 111320.7020576856, 278.2353980772752, 2485758.690035394, 6070.750963243378, 54821.18345352118, 9540.606633304236, -2710.55326746645, 1405.483844121726, 22.5),
-    (-0.0003218135878613132, 111320.7020701615, 0.00369383431289, 823725.6402795718, 0.46104986909093, 2351.343141331292, 1.58060784298199, 8.77738589078284, 0.37238884252424, 7.45)
-)
+        return (realx, 2**z - realy, z)
 
 def offset_bd(x, y, z):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        realpos = prcoords.wgs_gcj(num2deg(x, y, z), True)
+        realpos = prcoords.wgs_bd(num2deg(x, y+1, z), True)
     z += 1
     for i, Kj_d in enumerate(range(75, -15, -15)):
         if abs(realpos.lat) >= Kj_d:
             mc = BD_LL2MC[i]
+            break
     lng = mc[0] + mc[1] * abs(realpos.lon)
     c = abs(realpos.lat) / mc[9]
     lat = mc[2] + mc[3] * c + mc[4] * c * c + mc[5] * c**3 + mc[6] * c**4 + mc[7] * c**5 + mc[8] * c**6
     lng = math.copysign(lng, realpos.lon)
     lat = math.copysign(lat, realpos.lat)
-    x = lng * 2 ** (z - 18 - 8)
-    y = y0 = lat * 2 ** (z - 18 - 8)
-    #yf = math.floor(y0)
-    #y = yf + 1 - (y0 - yf)
+    x = lng * 2**(z - 18 - 8)
+    y = lat * 2**(z - 18 - 8)
     return (x, y, z)
 
 OFFSET_FN = {
@@ -190,26 +187,55 @@ OFFSET_SGN = {
     'bd': (1, -1)
 }
 
-def stitch_tiles(tiles, x, y, sgnxy, name):
-    xfrac = x - math.floor(x) if sgnxy[0] == 1 else math.ceil(x) - x
-    yfrac = y - math.floor(y) if sgnxy[1] == 1 else math.ceil(y) - y
+def is_black(im):
+    if len(im.mode) >= 3:
+        bandn = 3
+    else:
+        bandn = 1
+    for band in range(bandn):
+        if any(im.getdata(band)):
+            return False
+    return True
+
+def stitch_tiles(tiles, corners, x, y, width, height, sgnxy, name):
+    bbox = (math.floor(x), math.floor(y),
+            math.ceil(x + width), math.ceil(y + height))
+    xfrac = x - bbox[0] if sgnxy[0] == 1 else (bbox[2] - width - x)
+    yfrac = y - bbox[1] if sgnxy[1] == 1 else (bbox[3] - height - y)
     ims = [Image.open(io.BytesIO(b)) for b, _ in tiles]
     size = ims[0].size
-    if ims[0].mode in ('P', 'RGBA'):
-        mode = 'RGBA'
-    else:
-        mode = 'RGB'
-    newim = Image.new(mode, (size[0]*2, size[1]*2))
-    if sgnxy == (1, 1):
-        corners = CORNERS
-    else:
-        corners = tuple((x*sgnxy[0] + (sgnxy[0]==-1), y*sgnxy[1] + (sgnxy[1]==-1))
-                         for x, y in CORNERS)
-    for i, dxy in enumerate(corners):
-        newim.paste(ims[i], (size[0]*dxy[0], size[1]*dxy[1]))
+    mode = 'RGB' if ims[0].mode == 'RGB' else 'RGBA'
+    newim = Image.new(mode, (
+        size[0]*(bbox[2]-bbox[0]), size[1]*(bbox[3]-bbox[1])))
+    minx = bbox[0] if sgnxy[0] == 1 else bbox[2]-1
+    miny = bbox[1] if sgnxy[1] == 1 else bbox[3]-1
+    for i, xy in enumerate(corners):
+        dx = abs(xy[0] - minx)
+        dy = abs(xy[1] - miny)
+        xy0 = (size[0]*dx, size[1]*dy)
+        if mode == 'RGB':
+            newim.paste(ims[i], xy0)
+        else:
+            im = ims[i].convert(mode)
+            if is_black(im):
+                newimdraw = ImageDraw.Draw(newim)
+                newimdraw.rectangle(
+                    (xy0, (xy0[0]+size[0], xy0[1]+size[1])), (0,0,0,0), None)
+                del newimdraw
+            else:
+                newim.paste(im, xy0)
     x2 = round(size[0]*xfrac)
     y2 = round(size[1]*yfrac)
-    retim = newim.crop((x2, y2, x2+size[0], y2+size[1]))
+    imgw = round(size[0]*width)
+    imgh = round(size[1]*height)
+    # debug
+    #newim1 = newim.copy()
+    #imdraw = ImageDraw.Draw(newim1)
+    #imdraw.rectangle((x2, y2, x2+imgw, y2+imgh), outline='black')
+    #newim1.save('%s-%d-%d.png' % (name, x, y))
+    retim = newim.crop((x2, y2, x2+imgw, y2+imgh))
+    if not (imgw == size[0] and imgh == size[1]):
+        retim = retim.resize(size, Image.BICUBIC)
     retb = io.BytesIO()
     if ims[0].format == 'JPEG':
         retim.save(retb, 'JPEG', quality=92)
@@ -223,6 +249,8 @@ def stitch_tiles(tiles, x, y, sgnxy, name):
 @tornado.gen.coroutine
 def get_tile(source, z, x, y, retina=False, client_headers=None):
     api = APIS[source]
+    x = int(x)
+    y = int(y)
     cache_key = '%s%s/%d/%d/%d' % (source, '@2x' if retina else '', z, x, y)
     res = TILE_SOURCE_CACHE.get(cache_key)
     if res:
@@ -246,20 +274,31 @@ def get_tile(source, z, x, y, retina=False, client_headers=None):
 def draw_tile(source, z, x, y, retina=False, client_headers=None):
     api = APIS[source]
     retina = ('url2x' in api and retina)
+    check_int = lambda x: abs(x - round(x)) < 0.002
     if 'offset' not in api or (z < 8 and OFFSET_SGN[api['offset']] == (1, 1)):
         res = yield get_tile(source, z, x, y, retina, client_headers)
         return res
     else:
-        realxyz = OFFSET_FN[api['offset']](x, y, z)
         sgnxy = OFFSET_SGN[api['offset']]
+        realx, realy, realz = OFFSET_FN[api['offset']](x, y, z)
+        realxyz1 = OFFSET_FN[api['offset']](x+sgnxy[0], y+sgnxy[1], z)
+        width = abs(realxyz1[0] - realx)
+        height = abs(realxyz1[1] - realy)
+        if (check_int(realx) and check_int(realy)
+            and check_int(width) and check_int(height)):
+            res = yield get_tile(source, realz, realx, realy,
+                                 retina, client_headers)
+            return res
         futures = []
-        for dx1, dy1 in CORNERS:
-            x1 = math.floor(realxyz[0]) + dx1
-            y1 = math.floor(realxyz[1]) + dy1
+        corners = tuple(itertools.product(
+            range(math.floor(realx), math.ceil(realx + width)),
+            range(math.floor(realy), math.ceil(realy + height))))
+        for x1, y1 in corners:
             futures.append(get_tile(
-                source, realxyz[2], x1, y1, retina, client_headers))
+                source, realz, x1, y1, retina, client_headers))
         tiles = yield futures
-        return stitch_tiles(tiles, realxyz[0], realxyz[1], sgnxy, source)
+        return stitch_tiles(
+            tiles, corners, realx, realy, width, height, sgnxy, source)
 
 
 class MainHandler(tornado.web.RequestHandler):
