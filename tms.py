@@ -110,15 +110,15 @@ def load_config():
         return
     config = configparser.ConfigParser(interpolation=None)
     config.read(CONFIG_FILE)
-    APIS = {}
+    APIS = collections.OrderedDict()
     for name, cfgsection in config.items():
         if name in ('DEFAULT', 'CONFIG'):
             continue
-        section = collections.OrderedDict(cfgsection)
+        section = dict(cfgsection)
         if 's' in section:
             section['s'] = section['s'].split(',')
         APIS[name] = section
-    cfg = collections.OrderedDict(config['CONFIG'])
+    cfg = dict(config['CONFIG'])
     cfg['port'] = int(cfg['port'])
     cfg['cache_size'] = int(cfg['cache_size'])
     cfg['cache_ttl'] = int(cfg['cache_ttl'])
