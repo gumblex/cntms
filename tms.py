@@ -114,11 +114,11 @@ def load_config():
     for name, cfgsection in config.items():
         if name in ('DEFAULT', 'CONFIG'):
             continue
-        section = dict(cfgsection)
+        section = collections.OrderedDict(cfgsection)
         if 's' in section:
             section['s'] = section['s'].split(',')
         APIS[name] = section
-    cfg = dict(config['CONFIG'])
+    cfg = collections.OrderedDict(config['CONFIG'])
     cfg['port'] = int(cfg['port'])
     cfg['cache_size'] = int(cfg['cache_size'])
     cfg['cache_ttl'] = int(cfg['cache_ttl'])
