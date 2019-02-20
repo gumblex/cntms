@@ -6,3 +6,5 @@ This TMS proxy solves the problems that map services in China geneally have dist
 Supports: Baidu, Tencent, Gaode, Google, GeoQ, Tianditu, and OpenStreetMap.
 
 Edit `tmsapi.ini` to set listen address, port, cache size, and upstream APIs.
+
+Use this software at your own risk.
