@@ -36,7 +36,15 @@ BD_LL2MC = (
     (-0.0003218135878613132, 111320.7020701615, 0.00369383431289, 823725.6402795718, 0.46104986909093, 2351.343141331292, 1.58060784298199, 8.77738589078284, 0.37238884252424, 7.45)
 )
 
-HEADERS_WHITELIST = {'User-Agent', 'Accept', 'Accept-Language'}
+HEADERS_WHITELIST = {
+    'Accept-Encoding',
+    'Upgrade-Insecure-Requests',
+    'Dnt',
+    'Cookie',
+    'User-Agent',
+    'Accept',
+    'Accept-Language'
+}
 HTTP_CLIENT = tornado.curl_httpclient.CurlAsyncHTTPClient()
 
 class TileCache(collections.abc.MutableMapping):
