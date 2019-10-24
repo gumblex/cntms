@@ -384,6 +384,12 @@ def make_app():
     ])
 
 if __name__ == '__main__':
+    try:
+        import uvloop
+        uvloop.install()
+    except ImportError:
+        pass
+
     app = make_app()
     app.listen(CONFIG['port'], CONFIG['listen'])
     tornado.ioloop.IOLoop.current().start()
