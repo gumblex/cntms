@@ -311,13 +311,12 @@ def draw_tile(source, z, x, y, retina=False, client_headers=None):
 
 class MainHandler(tornado.web.RequestHandler):
     def get(self):
-        url = self.request.full_url()
         html = ('<!DOCTYPE html><html><head><title>TMS Tile Proxy Server</title>'
                 '</head><body><h1>TMS Tile Proxy Server</h1>'
                 '<h2><a href="/map">Demo</a></h2>'
                 '<h2>Endpoints</h2><dl>%s</dl></body></html>') % ''.join(
-                '<dt>%s</dt><dd>%s%s/{z}/{x}/{y}%s</dd>' % (APIS[s].get('name', s),
-                url, s, '{@2x}' if 'url2x' in APIS[s] else '') for s in APIS)
+                '<dt>%s</dt><dd>/%s/{z}/{x}/{y}%s</dd>' % (APIS[s].get('name', s),
+                s, '{@2x}' if 'url2x' in APIS[s] else '') for s in APIS)
         self.write(html)
 
 class TestHandler(tornado.web.RequestHandler):
