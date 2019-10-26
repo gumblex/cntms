@@ -311,11 +311,13 @@ def draw_tile(source, z, x, y, retina=False, client_headers=None):
 
 class MainHandler(tornado.web.RequestHandler):
     def get(self):
+        url = self.request.full_url()
         html = ('<!DOCTYPE html><html><head><title>TMS Tile Proxy Server</title>'
-                '</head><body><p>Endpoints:</p><ul>%s</ul>'
-                '<p><a href="/map">Demo</a></p></body></html>') % ''.join(
-                '<li>%s: /%s/{z}/{x}/{y}%s</li>' % (APIS[s].get('name', s),
-                s, '{@2x}' if 'url2x' in APIS[s] else '') for s in APIS)
+                '</head><body><h1>TMS Tile Proxy Server</h1>'
+                '<h2><a href="/map">Demo</a></h2>'
+                '<h2>Endpoints</h2><dl>%s</dl></body></html>') % ''.join(
+                '<dt>%s</dt><dd>%s%s/{z}/{x}/{y}%s</dd>' % (APIS[s].get('name', s),
+                url, s, '{@2x}' if 'url2x' in APIS[s] else '') for s in APIS)
         self.write(html)
 
 class TestHandler(tornado.web.RequestHandler):
@@ -385,8 +387,9 @@ def make_app():
 
 if __name__ == '__main__':
     try:
+        import asyncio
         import uvloop
-        uvloop.install()
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     except ImportError:
         pass
 
