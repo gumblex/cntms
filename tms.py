@@ -385,13 +385,6 @@ def make_app():
     ])
 
 if __name__ == '__main__':
-    try:
-        import asyncio
-        import uvloop
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    except ImportError:
-        pass
-
     app = make_app()
     app.listen(CONFIG['port'], CONFIG['listen'])
     tornado.ioloop.IOLoop.current().start()
