@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
 import io
 import time
 import math
@@ -11,6 +12,7 @@ import warnings
 import itertools
 import collections
 import configparser
+import concurrent.futures
 
 import prcoords
 import tornado.web
@@ -224,7 +226,9 @@ def stitch_tiles(tiles, corners, x, y, width, height, sgnxy, name):
         if mode == 'RGB':
             newim.paste(ims[i], xy0)
         else:
-            im = ims[i].convert(mode)
+            im = ims[i]
+            if im.mode != mode:
+                im = im.convert(mode)
             if is_black(im):
                 newimdraw = ImageDraw.Draw(newim)
                 newimdraw.rectangle(
@@ -254,8 +258,7 @@ def stitch_tiles(tiles, corners, x, y, width, height, sgnxy, name):
     [i.close() for i in ims]
     return retb.getvalue(), tiles[0][1]
 
-@tornado.gen.coroutine
-def get_tile(source, z, x, y, retina=False, client_headers=None):
+async def get_tile(source, z, x, y, retina=False, client_headers=None):
     api = APIS[source]
     x = int(x)
     y = int(y)
@@ -271,20 +274,19 @@ def get_tile(source, z, x, y, retina=False, client_headers=None):
         headers = {k:v for k,v in client_headers.items() if k in HEADERS_WHITELIST}
     else:
         headers = None
-    response = yield HTTP_CLIENT.fetch(
+    response = await HTTP_CLIENT.fetch(
         url, headers=headers, connect_timeout=20,
         proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'))
     res = (response.body, response.headers['Content-Type'])
     TILE_SOURCE_CACHE[cache_key] = res
     return res
 
-@tornado.gen.coroutine
-def draw_tile(source, z, x, y, retina=False, client_headers=None):
+async def draw_tile(source, z, x, y, retina=False, client_headers=None):
     api = APIS[source]
     retina = ('url2x' in api and retina)
     check_int = lambda x: abs(x - round(x)) < 0.002
     if 'offset' not in api or (z < 8 and OFFSET_SGN[api['offset']] == (1, 1)):
-        res = yield get_tile(source, z, x, y, retina, client_headers)
+        res = await get_tile(source, z, x, y, retina, client_headers)
         return res
     else:
         sgnxy = OFFSET_SGN[api['offset']]
@@ -294,7 +296,7 @@ def draw_tile(source, z, x, y, retina=False, client_headers=None):
         height = abs(realxyz1[1] - realy)
         if (check_int(realx) and check_int(realy)
             and check_int(width) and check_int(height)):
-            res = yield get_tile(source, realz, realx, realy,
+            res = await get_tile(source, realz, realx, realy,
                                  retina, client_headers)
             return res
         futures = []
@@ -304,9 +306,11 @@ def draw_tile(source, z, x, y, retina=False, client_headers=None):
         for x1, y1 in corners:
             futures.append(get_tile(
                 source, realz, x1, y1, retina, client_headers))
-        tiles = yield futures
-        return stitch_tiles(
+        tiles = await tornado.gen.multi(futures)
+        ioloop = tornado.ioloop.IOLoop.current()
+        result = await ioloop.run_in_executor(None, stitch_tiles,
             tiles, corners, realx, realy, width, height, sgnxy, source)
+        return result
 
 
 class MainHandler(tornado.web.RequestHandler):
@@ -358,10 +362,9 @@ class TMSHandler(tornado.web.RequestHandler):
     def initialize(self, *args, **kwargs):
         self.headers = self.request.headers
 
-    @tornado.gen.coroutine
-    def get(self, name, z, x, y, retina):
+    async def get(self, name, z, x, y, retina):
         try:
-            res = yield draw_tile(
+            res = await draw_tile(
                 name, int(z), int(x), int(y), bool(retina), self.request.headers)
         except tornado.httpclient.HTTPError as ex:
             if ex.code == 404:
@@ -387,4 +390,7 @@ def make_app():
 if __name__ == '__main__':
     app = make_app()
     app.listen(CONFIG['port'], CONFIG['listen'])
-    tornado.ioloop.IOLoop.current().start()
+    ioloop = tornado.ioloop.IOLoop.current()
+    ioloop.set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()))
+    ioloop.start()
