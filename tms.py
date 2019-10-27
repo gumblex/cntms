@@ -8,15 +8,18 @@ import math
 import json
 import random
 import sqlite3
+import weakref
 import warnings
 import itertools
 import collections
 import configparser
+import collections.abc
 import concurrent.futures
 
 import prcoords
 import tornado.web
 import tornado.gen
+import tornado.locks
 import tornado.ioloop
 import tornado.curl_httpclient
 from PIL import Image, ImageDraw
@@ -112,7 +115,43 @@ class TileCache(collections.abc.MutableMapping):
         except KeyError:
             return default
 
+class KeyedAsyncLocks(collections.abc.Collection):
+    """
+    asyncio.Lock with names.
+    Automatically create and delete locks for specified names.
+    """
+    def __init__(self):
+        self.locks = weakref.WeakValueDictionary()
+
+    def __len__(self) -> int:
+        return len(self.locks)
+
+    def __getitem__(self, item) -> 'tornado.locks.Lock':
+        lock = self.locks.get(item)
+        if lock is None:
+            self.locks[item] = lock = tornado.locks.Lock()
+        return lock
+
+    def __delitem__(self, key) -> None:
+        try:
+            del self.locks[key]
+        except KeyError:
+            pass
+
+    def __iter__(self):
+        return iter(self.locks)
+
+    def __contains__(self, item):
+        return item in self.locks
+
+    def keys(self):
+        return self.locks.keys()
+
+    def items(self):
+        return self.locks.items()
+
 TILE_SOURCE_CACHE = {}
+TILE_GET_LOCKS = KeyedAsyncLocks()
 
 def load_config():
     global APIS, TILE_SOURCE_CACHE, CONFIG
@@ -263,23 +302,25 @@ async def get_tile(source, z, x, y, retina=False, client_headers=None):
     x = int(x)
     y = int(y)
     cache_key = '%s%s/%d/%d/%d' % (source, '@2x' if retina else '', z, x, y)
-    res = TILE_SOURCE_CACHE.get(cache_key)
-    if res:
+    async with TILE_GET_LOCKS[cache_key]:
+        res = TILE_SOURCE_CACHE.get(cache_key)
+        if res:
+            return res
+        url = api['url2x' if retina else 'url'].format(
+            s=(random.choice(api['s']) if 's' in api else ''),
+            x=x, y=y, z=z, x4=(x>>4), y4=(y>>4),
+            xm=str(x).replace('-', 'M'), ym=str(y).replace('-', 'M'))
+        if client_headers:
+            headers = {k:v for k,v in client_headers.items()
+                       if k in HEADERS_WHITELIST}
+        else:
+            headers = None
+        response = await HTTP_CLIENT.fetch(
+            url, headers=headers, connect_timeout=20,
+            proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'))
+        res = (response.body, response.headers['Content-Type'])
+        TILE_SOURCE_CACHE[cache_key] = res
         return res
-    url = api['url2x' if retina else 'url'].format(
-        s=(random.choice(api['s']) if 's' in api else ''),
-        x=x, y=y, z=z, x4=(x>>4), y4=(y>>4),
-        xm=str(x).replace('-', 'M'), ym=str(y).replace('-', 'M'))
-    if client_headers:
-        headers = {k:v for k,v in client_headers.items() if k in HEADERS_WHITELIST}
-    else:
-        headers = None
-    response = await HTTP_CLIENT.fetch(
-        url, headers=headers, connect_timeout=20,
-        proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'))
-    res = (response.body, response.headers['Content-Type'])
-    TILE_SOURCE_CACHE[cache_key] = res
-    return res
 
 async def draw_tile(source, z, x, y, retina=False, client_headers=None):
     api = APIS[source]
