@@ -15,6 +15,7 @@ import collections
 import configparser
 import collections.abc
 import concurrent.futures
+import pycurl
 
 import prcoords
 import tornado.web
@@ -51,6 +52,9 @@ HEADERS_WHITELIST = {
     'Accept-Language'
 }
 HTTP_CLIENT = tornado.curl_httpclient.CurlAsyncHTTPClient()
+
+def prepare_curl_socks5(curl):
+    curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS5)
 
 class TileCache(collections.abc.MutableMapping):
 
@@ -317,7 +321,8 @@ async def get_tile(source, z, x, y, retina=False, client_headers=None):
             headers = None
         response = await HTTP_CLIENT.fetch(
             url, headers=headers, connect_timeout=20,
-            proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'))
+            proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'), 
+            prepare_curl_callback=(prepare_curl_socks5 if 'socks5' == CONFIG.get('proxy_type') else None))
         res = (response.body, response.headers['Content-Type'])
         TILE_SOURCE_CACHE[cache_key] = res
         return res
