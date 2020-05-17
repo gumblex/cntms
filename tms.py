@@ -162,7 +162,7 @@ def load_config():
     if APIS:
         return
     config = configparser.ConfigParser(interpolation=None)
-    config.read(CONFIG_FILE)
+    config.read(CONFIG_FILE, 'utf-8')
     APIS = collections.OrderedDict()
     for name, cfgsection in config.items():
         if name in ('DEFAULT', 'CONFIG'):
