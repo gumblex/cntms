@@ -23,7 +23,13 @@ import tornado.gen
 import tornado.locks
 import tornado.ioloop
 import tornado.curl_httpclient
-from PIL import Image, ImageDraw
+from PIL import Image
+
+try:
+    import certifi
+    CA_CERTS = certifi.where()
+except ImportError:
+    CA_CERTS = None
 
 # Earth mean radius
 R_EARTH = 6371000
@@ -178,7 +184,8 @@ def load_config():
     if 'proxy_port' in cfg:
         cfg['proxy_port'] = int(cfg['proxy_port'])
     CONFIG = cfg
-    TILE_SOURCE_CACHE = TileCache(cfg['cache_db'], cfg['cache_size'], cfg['cache_ttl'])
+    TILE_SOURCE_CACHE = TileCache(
+        cfg['cache_db'], cfg['cache_size'], cfg['cache_ttl'])
 
 def num2deg(xtile, ytile, zoom):
     n = 2 ** zoom
@@ -240,65 +247,52 @@ OFFSET_SGN = {
     'bd': (1, -1)
 }
 
-def is_black(im):
-    if len(im.mode) >= 3:
-        bandn = 3
+def is_empty(im):
+    extrema = im.getextrema()
+    if len(extrema) >= 3:
+        if len(extrema) > 3 and extrema[-1] == (0, 0):
+            return True
+        for ext in extrema[:3]:
+            if ext != (0, 0):
+                return False
+        return True
     else:
-        bandn = 1
-    for band in range(bandn):
-        if any(im.getdata(band)):
-            return False
-    return True
+        return extrema[0] == (0, 0)
 
-def stitch_tiles(tiles, corners, x, y, width, height, sgnxy, name):
-    bbox = (math.floor(x), math.floor(y),
-            math.ceil(x + width), math.ceil(y + height))
-    xfrac = x - bbox[0] if sgnxy[0] == 1 else (bbox[2] - width - x)
-    yfrac = y - bbox[1] if sgnxy[1] == 1 else (bbox[3] - height - y)
+def stitch_tiles(tiles, corners, bbox, grid, sgnxy, name):
     ims = [Image.open(io.BytesIO(b)) for b, _ in tiles]
     size = ims[0].size
-    mode = 'RGB' if ims[0].mode == 'RGB' else 'RGBA'
+    orig_format = ims[0].format
+    orig_mode = ims[0].mode
+    mode = 'RGB' if orig_mode == 'RGB' else 'RGBA'
     newim = Image.new(mode, (
         size[0]*(bbox[2]-bbox[0]), size[1]*(bbox[3]-bbox[1])))
-    minx = bbox[0] if sgnxy[0] == 1 else bbox[2]-1
-    miny = bbox[1] if sgnxy[1] == 1 else bbox[3]-1
+    mesh = calc_pil_mesh(sgnxy, size, bbox, grid)
     for i, xy in enumerate(corners):
-        dx = abs(xy[0] - minx)
-        dy = abs(xy[1] - miny)
-        xy0 = (size[0]*dx, size[1]*dy)
+        xy0 = (size[0]*xy[0][0], size[1]*xy[1][0])
         if mode == 'RGB':
             newim.paste(ims[i], xy0)
         else:
             im = ims[i]
             if im.mode != mode:
                 im = im.convert(mode)
-            if is_black(im):
-                newimdraw = ImageDraw.Draw(newim)
-                newimdraw.rectangle(
-                    (xy0, (xy0[0]+size[0], xy0[1]+size[1])), (0,0,0,0), None)
-                del newimdraw
+            if is_empty(im):
+                newim.paste((0,0,0,0), xy0 + (xy0[0]+size[0], xy0[1]+size[1]))
             else:
                 newim.paste(im, xy0)
-    x2 = round(size[0]*xfrac)
-    y2 = round(size[1]*yfrac)
-    imgw = round(size[0]*width)
-    imgh = round(size[1]*height)
-    # debug
-    #newim1 = newim.copy()
-    #imdraw = ImageDraw.Draw(newim1)
-    #imdraw.rectangle((x2, y2, x2+imgw, y2+imgh), outline='black')
-    #newim1.save('%s-%d-%d.png' % (name, x, y))
-    retim = newim.crop((x2, y2, x2+imgw, y2+imgh))
-    if not (imgw == size[0] and imgh == size[1]):
-        retim = retim.resize(size, Image.BICUBIC)
+        ims[i].close()
+    del ims
+    retim = newim.transform(size, Image.MESH, mesh, resample=Image.BICUBIC)
+    newim.close()
+    del newim
     retb = io.BytesIO()
-    if ims[0].format == 'JPEG':
+    if orig_format == 'JPEG':
         retim.save(retb, 'JPEG', quality=92)
     else:
-        retim.save(retb, ims[0].format)
-    newim.close()
+        if orig_mode == 'P':
+            retim = retim.quantize(colors=256)
+        retim.save(retb, orig_format)
     retim.close()
-    [i.close() for i in ims]
     return retb.getvalue(), tiles[0][1]
 
 async def get_tile(source, z, x, y, retina=False, client_headers=None):
@@ -320,42 +314,94 @@ async def get_tile(source, z, x, y, retina=False, client_headers=None):
         else:
             headers = None
         response = await HTTP_CLIENT.fetch(
-            url, headers=headers, connect_timeout=20,
+            url, headers=headers, connect_timeout=10, ca_certs=CA_CERTS,
             proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'), 
             prepare_curl_callback=(prepare_curl_socks5 if 'socks5' == CONFIG.get('proxy_type') else None))
         res = (response.body, response.headers['Content-Type'])
         TILE_SOURCE_CACHE[cache_key] = res
         return res
 
+def calc_grid(x, y, z, sgnxy, off_fn, grid_num=8):
+    sgnx, sgny = sgnxy
+    sx0, sx1 = sorted((x, x+sgnx))
+    sy0, sy1 = sorted((y, y+sgny))
+    bbox = [float('inf'), float('inf'), float('-inf'), float('-inf')]
+    grid = []
+    tz = z
+    for i in range(grid_num+1):
+        gx = sx0 + i / grid_num
+        column = []
+        for j in range(grid_num+1):
+            gy = sy0 + j / grid_num
+            tx, ty, tz = off_fn(gx, gy, z)
+            column.append((gx - sx0, gy - sy0, tx, ty))
+            if i == 0 or i == grid_num:
+                bbox[0] = min(bbox[0], tx)
+                bbox[2] = max(bbox[2], tx)
+            if j == 0 or j == grid_num:
+                bbox[1] = min(bbox[1], ty)
+                bbox[3] = max(bbox[3], ty)
+        grid.append(column)
+    bbox = [
+        math.floor(bbox[0]), math.floor(bbox[1]),
+        math.ceil(bbox[2]), math.ceil(bbox[3]),
+    ]
+    return bbox, grid, tz
+
+def calc_pil_mesh(sgnxy, size, bbox, grid):
+    sgnx, sgny = sgnxy
+    szx, szy = size
+    dx = -bbox[0] if sgnx == 1 else bbox[2]
+    dy = -bbox[1] if sgny == 1 else bbox[3]
+    pil_mesh = []
+    for i, column in enumerate(grid[1:], 1):
+        for j, coords in enumerate(column[1:], 1):
+            sx0, sy0, tx0, ty0 = grid[i-1][j-1]
+            sx1, sy1, tx1, ty1 = coords
+            pil_mesh.append((
+                (int(sx0 * szx), int(sy0 * szy),
+                 int(sx1 * szx), int(sy1 * szy)),
+                ((tx0 * sgnx + dx) * szx, (ty0 * sgny + dy) * szy,
+                 (tx0 * sgnx + dx) * szx, (ty1 * sgny + dy) * szy,
+                 (tx1 * sgnx + dx) * szx, (ty1 * sgny + dy) * szy,
+                 (tx1 * sgnx + dx) * szx, (ty0 * sgny + dy) * szy)
+            ))
+    return pil_mesh
+            
+
 async def draw_tile(source, z, x, y, retina=False, client_headers=None):
     api = APIS[source]
     retina = ('url2x' in api and retina)
-    check_int = lambda x: abs(x - round(x)) < 0.002
-    if 'offset' not in api or (z < 8 and OFFSET_SGN[api['offset']] == (1, 1)):
+    if 'offset' not in api or (z < 1 and OFFSET_SGN[api['offset']] == (1, 1)):
         res = await get_tile(source, z, x, y, retina, client_headers)
         return res
     else:
         sgnxy = OFFSET_SGN[api['offset']]
-        realx, realy, realz = OFFSET_FN[api['offset']](x, y, z)
-        realxyz1 = OFFSET_FN[api['offset']](x+sgnxy[0], y+sgnxy[1], z)
-        width = abs(realxyz1[0] - realx)
-        height = abs(realxyz1[1] - realy)
-        if (check_int(realx) and check_int(realy)
-            and check_int(width) and check_int(height)):
+        off_fn = OFFSET_FN[api['offset']]
+        bbox, grid, realz = calc_grid(x, y, z, sgnxy, off_fn)
+        if (bbox[2] - bbox[0] == 1) and (bbox[3] - bbox[1] == 1):
+            realx = bbox[0] if sgnxy[0] == 1 else bbox[2] - 1
+            realy = bbox[1] if sgnxy[1] == 1 else bbox[3] - 1
             res = await get_tile(source, realz, realx, realy,
                                  retina, client_headers)
             return res
         futures = []
-        corners = tuple(itertools.product(
-            range(math.floor(realx), math.ceil(realx + width)),
-            range(math.floor(realy), math.ceil(realy + height))))
+        if sgnxy[0] == 1:
+            x_range = enumerate(range(bbox[0], bbox[2]))
+        else:
+            x_range = enumerate(range(bbox[2] - 1, bbox[0] - 1, -1))
+        if sgnxy[1] == 1:
+            y_range = enumerate(range(bbox[1], bbox[3]))
+        else:
+            y_range = enumerate(range(bbox[3] - 1, bbox[1] - 1, -1))
+        corners = tuple(itertools.product(x_range, y_range))
         for x1, y1 in corners:
             futures.append(get_tile(
-                source, realz, x1, y1, retina, client_headers))
+                source, realz, x1[1], y1[1], retina, client_headers))
         tiles = await tornado.gen.multi(futures)
         ioloop = tornado.ioloop.IOLoop.current()
         result = await ioloop.run_in_executor(None, stitch_tiles,
-            tiles, corners, realx, realy, width, height, sgnxy, source)
+            tiles, corners, bbox, grid, sgnxy, source)
         return result
 
 
