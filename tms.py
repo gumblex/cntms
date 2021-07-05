@@ -286,14 +286,18 @@ def stitch_tiles(tiles, corners, bbox, grid, sgnxy, name):
     newim.close()
     del newim
     retb = io.BytesIO()
+    mime_type = tiles[0][1]
     if orig_format == 'JPEG':
         retim.save(retb, 'JPEG', quality=92)
+        mime_type = 'image/jpeg'
     else:
         if orig_mode == 'P':
             retim = retim.quantize(colors=256)
         retim.save(retb, orig_format)
+        if orig_format == 'PNG':
+            mime_type = 'image/png'
     retim.close()
-    return retb.getvalue(), tiles[0][1]
+    return retb.getvalue(), mime_type
 
 async def get_tile(source, z, x, y, retina=False, client_headers=None):
     api = APIS[source]
