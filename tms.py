@@ -283,16 +283,18 @@ def stitch_tiles(tiles, corners, bbox, grid, sgnxy, name):
         ims[i].close()
     del ims
     retim = newim.transform(size, Image.MESH, mesh, resample=Image.BICUBIC)
+    if retim.mode == 'RGBA' and retim.getextrema()[3][0] >= 252:
+        retim = retim.convert('RGB')
     newim.close()
     del newim
     retb = io.BytesIO()
     mime_type = tiles[0][1]
     if orig_format == 'JPEG':
-        retim.save(retb, 'JPEG', quality=92)
+        retim.save(retb, 'JPEG', quality=93)
         mime_type = 'image/jpeg'
     else:
-        if orig_mode == 'P':
-            retim = retim.quantize(colors=256)
+        # if orig_mode == 'P':
+            # retim = retim.quantize(colors=256)
         retim.save(retb, orig_format)
         if orig_format == 'PNG':
             mime_type = 'image/png'
