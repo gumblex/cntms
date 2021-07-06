@@ -75,7 +75,7 @@ class TileCache(collections.abc.MutableMapping):
             'updated INTEGER,'
             'mime TEXT,'
             'img BLOB'
-        ')')
+        ') WITHOUT ROWID')
 
     def __contains__(self, key):
         r = self.db.execute(
@@ -260,15 +260,26 @@ def is_empty(im):
         return extrema[0] == (0, 0)
 
 def stitch_tiles(tiles, corners, bbox, grid, sgnxy, name):
-    ims = [Image.open(io.BytesIO(b)) for b, _ in tiles]
-    size = ims[0].size
-    orig_format = ims[0].format
-    orig_mode = ims[0].mode
+    ims = []
+    size = orig_format = orig_mode = None
+    for b, _ in tiles:
+        if b:
+            im = Image.open(io.BytesIO(b))
+            ims.append(im)
+            size = im.size
+            orig_format = im.format
+            orig_mode = im.mode
+        else:
+            ims.append(None)
+    if not size:
+        return None, None
     mode = 'RGB' if orig_mode == 'RGB' else 'RGBA'
     newim = Image.new(mode, (
         size[0]*(bbox[2]-bbox[0]), size[1]*(bbox[3]-bbox[1])))
     mesh = calc_pil_mesh(sgnxy, size, bbox, grid)
     for i, xy in enumerate(corners):
+        if ims[i] is None:
+            continue
         xy0 = (size[0]*xy[0][0], size[1]*xy[1][0])
         if mode == 'RGB':
             newim.paste(ims[i], xy0)
@@ -313,12 +324,15 @@ async def get_tile(source, z, x, y, retina=False, client_headers=None):
         url = api['url2x' if retina else 'url'].format(
             s=(random.choice(api['s']) if 's' in api else ''),
             x=x, y=y, z=z, x4=(x>>4), y4=(y>>4),
-            xm=str(x).replace('-', 'M'), ym=str(y).replace('-', 'M'))
+            xm=str(x).replace('-', 'M'), ym=str(y).replace('-', 'M'),
+            t=int(time.time() * 1000))
         if client_headers:
             headers = {k:v for k,v in client_headers.items()
                        if k in HEADERS_WHITELIST}
         else:
             headers = None
+        if 'referer' in api:
+            headers['Referer'] = api['referer']
         response = await HTTP_CLIENT.fetch(
             url, headers=headers, connect_timeout=10, ca_certs=CA_CERTS,
             proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'), 
@@ -471,6 +485,8 @@ class TMSHandler(tornado.web.RequestHandler):
                 raise
         except Exception:
             raise
+        if not res[0]:
+            raise tornado.web.HTTPError(404)
         self.set_header('Content-Type', res[1])
         self.set_header('Cache-Control', 'max-age=%d' % CONFIG['cache_ttl'])
         self.write(res[0])
