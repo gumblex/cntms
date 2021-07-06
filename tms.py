@@ -92,11 +92,16 @@ class TileCache(collections.abc.MutableMapping):
         else:
             raise KeyError(key)
 
-    def __setitem__(self, key, value):
+    def save(self, key, value, ttl=None):
+        if ttl is None:
+            ttl = self.ttl
         now = int(time.time())
         self.db.execute('REPLACE INTO cache VALUES (?,?,?,?,?)',
-            (key, now+self.ttl, now, value[1], value[0]))
+            (key, now+ttl, now, value[1], value[0]))
         self.expire()
+
+    def __setitem__(self, key, value):
+        self.save(key, value)
 
     def __delitem__(self, key):
         self.db.execute('DELETE FROM cache WHERE key=?', (key,))
@@ -181,6 +186,7 @@ def load_config():
     cfg['port'] = int(cfg['port'])
     cfg['cache_size'] = int(cfg['cache_size'])
     cfg['cache_ttl'] = int(cfg['cache_ttl'])
+    cfg['cache_realtime_ttl'] = int(cfg.get('cache_realtime_ttl', 60))
     if 'proxy_port' in cfg:
         cfg['proxy_port'] = int(cfg['proxy_port'])
     CONFIG = cfg
@@ -321,6 +327,7 @@ async def get_tile(source, z, x, y, retina=False, client_headers=None):
         res = TILE_SOURCE_CACHE.get(cache_key)
         if res:
             return res
+        realtime = api.get('realtime')
         url = api['url2x' if retina else 'url'].format(
             s=(random.choice(api['s']) if 's' in api else ''),
             x=x, y=y, z=z, x4=(x>>4), y4=(y>>4),
@@ -338,7 +345,11 @@ async def get_tile(source, z, x, y, retina=False, client_headers=None):
             proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'), 
             prepare_curl_callback=(prepare_curl_socks5 if 'socks5' == CONFIG.get('proxy_type') else None))
         res = (response.body, response.headers['Content-Type'])
-        TILE_SOURCE_CACHE[cache_key] = res
+        if realtime:
+            TILE_SOURCE_CACHE.save(
+                cache_key, res, CONFIG.get('cache_realtime_ttl', 0))
+        else:
+            TILE_SOURCE_CACHE[cache_key] = res
         return res
 
 def calc_grid(x, y, z, sgnxy, off_fn, grid_num=8):
@@ -483,12 +494,18 @@ class TMSHandler(tornado.web.RequestHandler):
                 raise tornado.web.HTTPError(404)
             else:
                 raise
+        except KeyError:
+            raise tornado.web.HTTPError(404)
         except Exception:
             raise
         if not res[0]:
             raise tornado.web.HTTPError(404)
+        if APIS[name].get('realtime'):
+            cache_ttl = CONFIG.get('cache_realtime_ttl', 0)
+        else:
+            cache_ttl = CONFIG['cache_ttl']
         self.set_header('Content-Type', res[1])
-        self.set_header('Cache-Control', 'max-age=%d' % CONFIG['cache_ttl'])
+        self.set_header('Cache-Control', 'max-age=%d' % cache_ttl)
         self.write(res[0])
 
 def make_app():
