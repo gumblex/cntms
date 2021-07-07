@@ -33,20 +33,10 @@ except ImportError:
 
 # Earth mean radius
 R_EARTH = 6371000
-EARTH_EQUATORIAL_RADIUS = 6378137
 
 CONFIG_FILE = 'tmsapi.ini'
 CONFIG = {}
 APIS = None
-
-BD_LL2MC = (
-    (-0.0015702102444, 111320.7020616939, 1704480524535203, -10338987376042340, 26112667856603880, -35149669176653700, 26595700718403920, -10725012454188240, 1800819912950474, 82.5),
-    (0.0008277824516172526, 111320.7020463578, 647795574.6671607, -4082003173.641316, 10774905663.51142, -15171875531.51559, 12053065338.62167, -5124939663.577472, 913311935.9512032, 67.5),
-    (0.00337398766765, 111320.7020202162, 4481351.045890365, -23393751.19931662, 79682215.47186455, -115964993.2797253, 97236711.15602145, -43661946.33752821, 8477230.501135234, 52.5),
-    (0.00220636496208, 111320.7020209128, 51751.86112841131, 3796837.749470245, 992013.7397791013, -1221952.21711287, 1340652.697009075, -620943.6990984312, 144416.9293806241, 37.5),
-    (-0.0003441963504368392, 111320.7020576856, 278.2353980772752, 2485758.690035394, 6070.750963243378, 54821.18345352118, 9540.606633304236, -2710.55326746645, 1405.483844121726, 22.5),
-    (-0.0003218135878613132, 111320.7020701615, 0.00369383431289, 823725.6402795718, 0.46104986909093, 2351.343141331292, 1.58060784298199, 8.77738589078284, 0.37238884252424, 7.45)
-)
 
 HEADERS_WHITELIST = {
     'Accept-Encoding',
@@ -203,7 +193,7 @@ def deg2num(lat, lon, zoom):
     lat_r = math.radians(lat)
     n = 2 ** zoom
     xtile = ((lon + 180) / 360 * n)
-    ytile = ((1 - math.log(math.tan(lat_r) + 1/math.cos(lat_r)) / math.pi) / 2 * n)
+    ytile = (1 - math.asinh(math.tan(lat_r)) / math.pi) * n / 2
     return (xtile, ytile)
 
 def offset_gcj(x, y, z):
@@ -224,23 +214,30 @@ def offset_qq(x, y, z):
         realx, realy = deg2num(zoom=z, *realpos)
         return (realx, 2**z - realy, z)
 
+def bd_merc(lon, lat):
+    # Baidu uses EPSG:7008, Clarke 1866
+    # PROJ:
+    # +proj=merc +a=6378206.4 +b=6356583.8 +lat_ts=0.0 +lon_0=0.0
+    # +x_0=0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs
+    a = 6378206.4
+    e = 0.08227185422300325876963654309
+    x = math.radians(lon) * a
+    phi = math.radians(lat)
+    sphi = math.sin(phi)
+    cphi = math.cos(phi)
+    y = math.asinh(sphi/cphi) - e * math.atanh(e * sphi)
+    y *= a
+    return (x, y)
+
 def offset_bd(x, y, z):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         realpos = prcoords.wgs_bd(num2deg(x, y+1, z), True)
     z += 1
-    for i, Kj_d in enumerate(range(75, -15, -15)):
-        if abs(realpos.lat) >= Kj_d:
-            mc = BD_LL2MC[i]
-            break
-    lng = mc[0] + mc[1] * abs(realpos.lon)
-    c = abs(realpos.lat) / mc[9]
-    lat = mc[2] + mc[3] * c + mc[4] * c * c + mc[5] * c**3 + mc[6] * c**4 + mc[7] * c**5 + mc[8] * c**6
-    lng = math.copysign(lng, realpos.lon)
-    lat = math.copysign(lat, realpos.lat)
-    x = lng * 2**(z - 18 - 8)
-    y = lat * 2**(z - 18 - 8)
-    return (x, y, z)
+    x, y = bd_merc(realpos.lon, realpos.lat)
+    factor = 2**(z - 18 - 8)
+    return (x * factor, y * factor, z)
+
 
 OFFSET_FN = {
     'gcj': offset_gcj,
