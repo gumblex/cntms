@@ -3,6 +3,7 @@
 
 import os
 import io
+import re
 import time
 import math
 import json
@@ -22,6 +23,7 @@ import tornado.web
 import tornado.gen
 import tornado.locks
 import tornado.ioloop
+import tornado.httpclient
 import tornado.curl_httpclient
 from PIL import Image
 
@@ -31,8 +33,12 @@ try:
 except ImportError:
     CA_CERTS = None
 
+warnings.simplefilter("ignore")
+
 # Earth mean radius
 R_EARTH = 6371000
+RES_3857 = 40075016.685578486153
+ORIGIN_3857 = 20037508.342789243077
 
 CONFIG_FILE = 'tmsapi.ini'
 CONFIG = {}
@@ -52,6 +58,11 @@ HTTP_CLIENT = tornado.curl_httpclient.CurlAsyncHTTPClient()
 def prepare_curl_socks5(curl):
     curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS5)
 
+def from4326_to3857(lon, lat):
+    x = math.radians(lon) * 6378137
+    y = math.asinh(math.tan(math.radians(lat))) * 6378137
+    return (x, y)
+
 class TileCache(collections.abc.MutableMapping):
 
     def __init__(self, filename, maxsize, ttl):
@@ -65,6 +76,10 @@ class TileCache(collections.abc.MutableMapping):
             'updated INTEGER,'
             'mime TEXT,'
             'img BLOB'
+        ') WITHOUT ROWID')
+        self.db.execute('CREATE TABLE IF NOT EXISTS metadata ('
+            'key TEXT PRIMARY KEY,'
+            'value TEXT'
         ') WITHOUT ROWID')
 
     def __contains__(self, key):
@@ -89,6 +104,17 @@ class TileCache(collections.abc.MutableMapping):
         self.db.execute('REPLACE INTO cache VALUES (?,?,?,?,?)',
             (key, now+ttl, now, value[1], value[0]))
         self.expire()
+
+    def set_meta(self, key, value):
+        self.db.execute('REPLACE INTO metadata VALUES (?,?)',
+            (key, json.dumps(value)))
+
+    def get_meta(self, key):
+        row = self.db.execute(
+            'SELECT value FROM metadata WHERE key=?', (key,)).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
 
     def __setitem__(self, key, value):
         self.save(key, value)
@@ -155,6 +181,319 @@ class KeyedAsyncLocks(collections.abc.Collection):
     def items(self):
         return self.locks.items()
 
+class TileProvider:
+    sgn = (1, 1)
+    has_metadata = False
+    retry_on_error = False
+
+    def __init__(self, name, url, url2x=None, servers=None, cache=None, attrs=None):
+        self.name = name
+        self.url = url
+        self.url2x = url2x
+        self.servers = servers
+        self.cache = cache
+        self.attrs = attrs or {}
+
+    def __contains__(self, item):
+        return item in self.attrs
+
+    def __getitem__(self, key):
+        return self.attrs[key]
+
+    def get(self, key, default=None):
+        return self.attrs.get(key, default)
+
+    def fast_offset_check(self, z):
+        return True
+
+    async def check_metadata(self, headers=None, no_cache=False):
+        return {}
+
+    def offset(self, x, y, z):
+        return (x, y, z)
+
+    def get_url(self, x, y, z, retina=False):
+        url = self.url2x if retina and self.url2x else self.url
+        return url.format(
+            s=(random.choice(self.servers) if self.servers else ''),
+            x=x, y=y, z=z, x4=(x>>4), y4=(y>>4),
+            xm=str(x).replace('-', 'M'), ym=str(y).replace('-', 'M'),
+            t=int(time.time() * 1000))
+
+class TMSTileProvider(TileProvider):
+    sgn = (1, -1)
+
+    def fast_offset_check(self, z):
+        return False
+
+    def offset(self, x, y, z):
+        return (x, 2**z - 1 - y, z)
+
+class GCJTileProvider(TileProvider):
+
+    def fast_offset_check(self, z):
+        return (z < 8)
+
+    def offset(self, x, y, z):
+        if z < 8:
+            return (x, y, z)
+        realpos = prcoords.wgs_gcj(num2deg(x, y, z), True)
+        realx, realy = deg2num(zoom=z, *realpos)
+        return (realx, realy, z)
+
+class QQTileProvider(TileProvider):
+    sgn = (1, -1)
+
+    def fast_offset_check(self, z):
+        return False
+
+    def offset(self, x, y, z):
+        if z < 8:
+            return (x, 2**z - 1 - y, z)
+        realpos = prcoords.wgs_gcj(num2deg(x, y+1, z), True)
+        realx, realy = deg2num(zoom=z, *realpos)
+        return (realx, 2**z - realy, z)
+
+class BaiduTileProvider(TileProvider):
+    sgn = (1, -1)
+
+    def fast_offset_check(self, z):
+        return False
+
+    @staticmethod
+    def bd_merc(lat, lon):
+        # Baidu uses EPSG:7008, Clarke 1866
+        # PROJ:
+        # +proj=merc +a=6378206.4 +b=6356583.8 +lat_ts=0.0 +lon_0=0.0
+        # +x_0=0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs
+        a = 6378206.4
+        e = 0.08227185422300325876963654309
+        x = math.radians(lon) * a
+        phi = math.radians(lat)
+        y = (math.asinh(math.tan(phi)) - e * math.atanh(e * math.sin(phi))) * a
+        return (x, y)
+
+    def offset(self, x, y, z):
+        realpos = prcoords.wgs_bd(num2deg(x, y+1, z), True)
+        if 'upscale' not in self.attrs:
+            z += 1
+        x, y = self.bd_merc(*realpos)
+        factor = 2**(z - 18 - 8)
+        return (x * factor, y * factor, z)
+
+class ArcGISMapServerProvider(TileProvider):
+    sgn = (1, 1)
+    has_metadata = True
+    no_offset = True
+
+    def __init__(self, name, url, cache=None, attrs=None):
+        self.name = name
+        self.url = url
+        self.cache = cache
+        self.attrs = attrs or {}
+        self.metadata = None
+        self.metadata_lock = tornado.locks.Lock()
+
+    def fast_offset_check(self, z):
+        return False
+
+    async def get_metadata(self, headers=None, no_cache=False):
+        if not no_cache:
+            if self.metadata is not None:
+                return
+            cached_metadata = self.cache.get_meta(self.name)
+            if cached_metadata is not None:
+                self.metadata = cached_metadata
+                return
+        client = tornado.curl_httpclient.CurlAsyncHTTPClient()
+        response = await client.fetch(
+            self.url + '?f=json',
+            headers=headers, connect_timeout=10, ca_certs=CA_CERTS,
+            proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'),
+            prepare_curl_callback=(prepare_curl_socks5
+                if 'socks5' == CONFIG.get('proxy_type') else None)
+        )
+        if response.code != 200:
+            raise RuntimeError("Can't get metadata: code %s" % response.code)
+        d = json.loads(response.body.decode('utf-8', errors='ignore'))
+        if not d.get('singleFusedMapCache'):
+            raise ValueError("Not tiled map")
+        tile_info = d['tileInfo']
+        spref = tile_info.get('spatialReference', {})
+        srid = spref.get('latestWkid', spref.get('wkid', 4326))
+        if srid == 102100:
+            srid = 3857
+        if srid not in (4326, 3857):
+            raise RuntimeError("Unsupported SRID: %s" % self.metadata['srid'])
+        self.metadata = {
+            'size': (tile_info['cols'], tile_info['rows']),
+            'srid': srid,
+            'origin': (tile_info['origin']['x'], tile_info['origin']['y']),
+            'levels': sorted(
+                (level['level'], level['resolution']*tile_info['rows'])
+                for level in tile_info['lods']
+            ),
+            'no_offset': False
+        }
+        if (srid == 3857 and self.no_offset and
+            math.isclose(-ORIGIN_3857, self.metadata['origin'][0]) and
+            math.isclose(ORIGIN_3857, self.metadata['origin'][1])):
+            no_offset = True
+            for level, resolution in self.metadata['levels']:
+                req_resolution = RES_3857 / 2 ** level
+                if not math.isclose(resolution, req_resolution, rel_tol=1/256):
+                    no_offset = False
+                    break
+            self.metadata['no_offset'] = no_offset
+        self.cache.set_meta(self.name, self.metadata)
+
+    async def check_metadata(self, headers=None, no_cache=False):
+        async with self.metadata_lock:
+            await self.get_metadata(headers, no_cache)
+        return {}
+
+    def convert_z(self, x, y, z, srid):
+        if srid == 3857:
+            req_resolution = RES_3857 / 2 ** z
+        elif srid == 4326:
+            lat0, lon0 = num2deg(x, y, z)
+            lat1, lon1 = num2deg(x + 1, y + 1, z)
+            req_resolution = math.sqrt(abs(lat1 - lat0) * abs(lon1 - lon0))
+        level = resolution = up_res = None
+        for level, resolution in self.metadata['levels']:
+            if abs(resolution - req_resolution) / req_resolution < 1/256:
+                return level, resolution
+            elif resolution < req_resolution:
+                break
+            up_res = (level, resolution)
+        if 'upscale' in self.attrs and up_res is not None:
+            return up_res
+        return level, resolution
+
+    @staticmethod
+    def offset_latlon(lat, lon):
+        return (lat, lon)
+
+    def offset(self, x, y, z):
+        realpos = tuple(reversed(self.offset_latlon(*num2deg(x, y, z))))
+        if self.metadata['srid'] == 3857:
+            realpos = from4326_to3857(*realpos)
+        tilez, resolution = self.convert_z(x, y, z, self.metadata['srid'])
+        if tilez is None:
+            return (None, None, None)
+        ox, oy = self.metadata['origin']
+        tilex = ((realpos[0] - ox) / resolution)
+        tiley = -((realpos[1] - oy) / resolution)
+        return (tilex, tiley, tilez)
+
+    def get_url(self, x, y, z, retina=False):
+        return '{url}/tile/{z}/{y}/{x}'.format(url=self.url, x=x, y=y, z=z)
+
+class TiandituTileProvider(TileProvider):
+    has_metadata = True
+    retry_on_error = True
+    re_ticket = re.compile(r'tk=([0-9A-Za-z]+)')
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.metadata = None
+        self.metadata_lock = tornado.locks.Lock()
+
+    async def get_metadata(self, headers=None, no_cache=False):
+        if not no_cache:
+            if self.metadata is not None:
+                return self.metadata['cookies']
+            cached_metadata = self.cache.get_meta(self.name)
+            if cached_metadata is not None:
+                self.metadata = cached_metadata
+                return self.metadata['cookies']
+        client = tornado.curl_httpclient.CurlAsyncHTTPClient()
+        response = await client.fetch(
+            'https://map.tianditu.gov.cn/2020/',
+            headers=headers, connect_timeout=10, ca_certs=CA_CERTS,
+            proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'),
+            prepare_curl_callback=(prepare_curl_socks5
+                if 'socks5' == CONFIG.get('proxy_type') else None)
+        )
+        if response.code != 200:
+            raise RuntimeError("Can't get metadata: code %s" % response.code)
+        match = self.re_ticket.search(
+            response.body.decode('utf-8', errors='ignore'))
+        if not match:
+            raise RuntimeError("Can't find ticket")
+        cookies = []
+        for cookie in response.headers.get_list("Set-Cookie"):
+            cookies.append(cookie.rsplit(';', 1)[0].strip())
+        self.metadata = {'ticket': match.group(1), 'cookies': cookies}
+        self.cache.set_meta(self.name, self.metadata)
+        return self.metadata['cookies']
+
+    async def check_metadata(self, headers=None, no_cache=False):
+        async with self.metadata_lock:
+            cookies = await self.get_metadata(headers, no_cache)
+        if headers and headers.get('Cookie'):
+            cookies.insert(0, headers['Cookie'])
+        return {
+            'Cookie': '; '.join(cookies),
+            'Referer': 'https://map.tianditu.gov.cn/'
+        }
+
+    def get_url(self, x, y, z, retina=False):
+        return self.url.format(
+            s=(random.choice(self.servers) if self.servers else ''),
+            x=x, y=y, z=z, tk=self.metadata['ticket'])
+
+class GCJMapServerProvider(ArcGISMapServerProvider):
+    no_offset = False
+
+    @staticmethod
+    def offset_latlon(lat, lon):
+        return prcoords.wgs_gcj((lat, lon), True)
+
+class TiandituShanghaiMapServerProvider(ArcGISMapServerProvider):
+    no_offset = False
+
+    @staticmethod
+    def offset_latlon(lat, lon):
+        o_lon = 121.3
+        # o_lat = 31.2
+        bK = 1.006
+        V = 1.0
+        bN = 0.99
+        bm = 0.0
+        x1 = 0.5
+        x2 = 1.0
+        v = (V - bK) / (x1 - bm)
+        bk = V - v * x1
+        j = (bN - V) / (x2 - x1)
+        bo = bN - j * (x2 - x1)
+        x_sgn = 1 if lon > o_lon else -1
+        d_lon = abs(lon - o_lon)
+        if d_lon < x1:
+            f = v * d_lon + bk
+            d_lon = f * d_lon
+            x = o_lon + d_lon * x_sgn
+            lon = x
+        elif d_lon > x1 and d_lon < x2:
+            d_lon = d_lon - x1
+            f = j * d_lon + bo
+            d_lon = f * d_lon
+            lon = o_lon + x1 * x_sgn + d_lon * x_sgn
+        return (lat, lon)
+
+
+SRC_TYPE = {
+    'xyz': TileProvider,
+    'tms': TMSTileProvider,
+    'gcj': GCJTileProvider,
+    'qq': QQTileProvider,
+    'bd': BaiduTileProvider,
+    'baidu': BaiduTileProvider,
+    'arcgis': ArcGISMapServerProvider,
+    'arcgis_gcj': GCJMapServerProvider,
+    'tianditu': TiandituTileProvider,
+    'shtdt': TiandituShanghaiMapServerProvider,
+}
 TILE_SOURCE_CACHE = {}
 TILE_GET_LOCKS = KeyedAsyncLocks()
 
@@ -164,14 +503,6 @@ def load_config():
         return
     config = configparser.ConfigParser(interpolation=None)
     config.read(CONFIG_FILE, 'utf-8')
-    APIS = collections.OrderedDict()
-    for name, cfgsection in config.items():
-        if name in ('DEFAULT', 'CONFIG'):
-            continue
-        section = dict(cfgsection)
-        if 's' in section:
-            section['s'] = section['s'].split(',')
-        APIS[name] = section
     cfg = dict(config['CONFIG'])
     cfg['port'] = int(cfg['port'])
     cfg['cache_size'] = int(cfg['cache_size'])
@@ -182,6 +513,22 @@ def load_config():
     CONFIG = cfg
     TILE_SOURCE_CACHE = TileCache(
         cfg['cache_db'], cfg['cache_size'], cfg['cache_ttl'])
+    APIS = collections.OrderedDict()
+    for name, cfgsection in config.items():
+        if name in ('DEFAULT', 'CONFIG'):
+            continue
+        section = dict(cfgsection)
+        src_type = section.get('type', section.get('offset', 'xyz'))
+        cls = SRC_TYPE.get(src_type)
+        if cls is None:
+            raise ValueError('unknown source API type: %s' % src_type)
+        kwargs = {'url': section.pop('url'), 'cache': TILE_SOURCE_CACHE}
+        if 'url2x' in section:
+            kwargs['url2x'] = section.pop('url2x')
+        if 's' in section:
+            kwargs['servers'] = section.pop('s').split(',')
+        kwargs['attrs'] = section
+        APIS[name] = cls(name, **kwargs)
 
 def num2deg(xtile, ytile, zoom):
     n = 2 ** zoom
@@ -190,65 +537,10 @@ def num2deg(xtile, ytile, zoom):
     return (lat, lon)
 
 def deg2num(lat, lon, zoom):
-    lat_r = math.radians(lat)
     n = 2 ** zoom
     xtile = ((lon + 180) / 360 * n)
-    ytile = (1 - math.asinh(math.tan(lat_r)) / math.pi) * n / 2
+    ytile = (1 - math.asinh(math.tan(math.radians(lat))) / math.pi) * n / 2
     return (xtile, ytile)
-
-def offset_gcj(x, y, z):
-    if z < 8:
-        return (x, y, z)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        realpos = prcoords.wgs_gcj(num2deg(x, y, z), True)
-        realx, realy = deg2num(zoom=z, *realpos)
-        return (realx, realy, z)
-
-def offset_qq(x, y, z):
-    if z < 8:
-        return (x, 2**z - 1 - y, z)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        realpos = prcoords.wgs_gcj(num2deg(x, y+1, z), True)
-        realx, realy = deg2num(zoom=z, *realpos)
-        return (realx, 2**z - realy, z)
-
-def bd_merc(lon, lat):
-    # Baidu uses EPSG:7008, Clarke 1866
-    # PROJ:
-    # +proj=merc +a=6378206.4 +b=6356583.8 +lat_ts=0.0 +lon_0=0.0
-    # +x_0=0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs
-    a = 6378206.4
-    e = 0.08227185422300325876963654309
-    x = math.radians(lon) * a
-    phi = math.radians(lat)
-    sphi = math.sin(phi)
-    cphi = math.cos(phi)
-    y = math.asinh(sphi/cphi) - e * math.atanh(e * sphi)
-    y *= a
-    return (x, y)
-
-def offset_bd(x, y, z):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        realpos = prcoords.wgs_bd(num2deg(x, y+1, z), True)
-    z += 1
-    x, y = bd_merc(realpos.lon, realpos.lat)
-    factor = 2**(z - 18 - 8)
-    return (x * factor, y * factor, z)
-
-
-OFFSET_FN = {
-    'gcj': offset_gcj,
-    'qq': offset_qq,
-    'bd': offset_bd
-}
-OFFSET_SGN = {
-    'gcj': (1, 1),
-    'qq': (1, -1),
-    'bd': (1, -1)
-}
 
 def is_empty(im):
     extrema = im.getextrema()
@@ -325,22 +617,34 @@ async def get_tile(source, z, x, y, retina=False, client_headers=None):
         if res:
             return res
         realtime = api.get('realtime')
-        url = api['url2x' if retina else 'url'].format(
-            s=(random.choice(api['s']) if 's' in api else ''),
-            x=x, y=y, z=z, x4=(x>>4), y4=(y>>4),
-            xm=str(x).replace('-', 'M'), ym=str(y).replace('-', 'M'),
-            t=int(time.time() * 1000))
-        if client_headers:
-            headers = {k:v for k,v in client_headers.items()
-                       if k in HEADERS_WHITELIST}
-        else:
-            headers = None
+        req_headers = client_headers.copy() or {}
+        client_kwargs = {
+            'headers': req_headers,
+            'connect_timeout': 10,
+            'ca_certs': CA_CERTS,
+            'proxy_host': CONFIG.get('proxy_host'),
+            'proxy_port': CONFIG.get('proxy_port'),
+            'prepare_curl_callback': (
+                prepare_curl_socks5 if 'socks5' == CONFIG.get('proxy_type')
+                else None
+            )
+        }
         if 'referer' in api:
-            headers['Referer'] = api['referer']
-        response = await HTTP_CLIENT.fetch(
-            url, headers=headers, connect_timeout=10, ca_certs=CA_CERTS,
-            proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'), 
-            prepare_curl_callback=(prepare_curl_socks5 if 'socks5' == CONFIG.get('proxy_type') else None))
+            req_headers['Referer'] = api['referer']
+        if api.has_metadata:
+            req_headers.update(await api.check_metadata(req_headers))
+        url = api.get_url(x, y, z, retina)
+        try:
+            response = await HTTP_CLIENT.fetch(url, **client_kwargs)
+        except tornado.httpclient.HTTPClientError as ex:
+            if ex.code == 404:
+                return (None, None)
+            elif ex.code >= 500:
+                raise
+            elif api.retry_on_error:
+                if api.has_metadata:
+                    req_headers.update(await api.check_metadata(req_headers, True))
+                response = await HTTP_CLIENT.fetch(url, **client_kwargs)
         res = (response.body, response.headers['Content-Type'])
         if realtime:
             TILE_SOURCE_CACHE.save(
@@ -395,18 +699,19 @@ def calc_pil_mesh(sgnxy, size, bbox, grid):
                  (tx1 * sgnx + dx) * szx, (ty0 * sgny + dy) * szy)
             ))
     return pil_mesh
-            
+
 
 async def draw_tile(source, z, x, y, retina=False, client_headers=None):
     api = APIS[source]
     retina = ('url2x' in api and retina)
-    if 'offset' not in api or (z < 1 and OFFSET_SGN[api['offset']] == (1, 1)):
+    if api.fast_offset_check(z):
         res = await get_tile(source, z, x, y, retina, client_headers)
         return res
     else:
-        sgnxy = OFFSET_SGN[api['offset']]
-        off_fn = OFFSET_FN[api['offset']]
-        bbox, grid, realz = calc_grid(x, y, z, sgnxy, off_fn)
+        if api.has_metadata:
+            await api.check_metadata(client_headers)
+        sgnxy = api.sgn
+        bbox, grid, realz = calc_grid(x, y, z, sgnxy, api.offset)
         if (bbox[2] - bbox[0] == 1) and (bbox[3] - bbox[1] == 1):
             realx = bbox[0] if sgnxy[0] == 1 else bbox[2] - 1
             realy = bbox[1] if sgnxy[1] == 1 else bbox[3] - 1
@@ -435,22 +740,27 @@ async def draw_tile(source, z, x, y, retina=False, client_headers=None):
 
 class MainHandler(tornado.web.RequestHandler):
     def get(self):
-        html = ('<!DOCTYPE html><html><head><title>TMS Tile Proxy Server</title>'
-                '</head><body><h1>TMS Tile Proxy Server</h1>'
-                '<h2><a href="/map">Demo</a></h2>'
-                '<h2>Endpoints</h2><dl>%s</dl></body></html>') % ''.join(
-                '<dt>%s</dt><dd>/%s/{z}/{x}/{y}%s</dd>' % (APIS[s].get('name', s),
-                s, '{@2x}' if 'url2x' in APIS[s] else '') for s in APIS)
+        html = (
+            '<!DOCTYPE html><html><head><title>TMS Tile Proxy Server</title>'
+            '</head><body><h1>TMS Tile Proxy Server</h1>'
+            '<h2><a href="/map">Demo</a></h2>'
+            '<h2>Endpoints</h2><dl>%s</dl></body></html>'
+        ) % ''.join('<dt>%s</dt><dd>/%s/{z}/{x}/{y}%s</dd>' % (
+            APIS[s].get('name', s), s, '{@2x}' if 'url2x' in APIS[s] else ''
+        ) for s in APIS)
         self.write(html)
 
 class TestHandler(tornado.web.RequestHandler):
     def get(self):
         TEST_TILES = ('14/13518/6396', '4/14/8', '8/203/132', '9/430/240')
-        html = ('<!DOCTYPE html><html><head><title>TMS Tile Proxy Server</title>'
-                '</head><body>%s</body></html>' % ''.join('<p>%s</p><p>%s</p>' % (
-                ''.join('<img src="/%s/%s" title="%s">' % (s, tile, s) for s in APIS),
-                ''.join('<img src="/%s/%s@2x" title="%s">' % (s, tile, s) for s in APIS
-                if 'url2x' in APIS[s])) for tile in TEST_TILES))
+        html = (
+            '<!DOCTYPE html><html><head><title>TMS Tile Proxy Server</title>'
+            '</head><body>%s</body></html>'
+        ) % ''.join('<p>%s</p><p>%s</p>' % (
+            ''.join('<img src="/%s/%s" title="%s">' % (s, tile, s) for s in APIS),
+            ''.join('<img src="/%s/%s@2x" title="%s">' % (s, tile, s) for s in APIS
+                if 'url2x' in APIS[s])
+        ) for tile in TEST_TILES)
         self.write(html)
 
 class RobotsTxtHandler(tornado.web.RequestHandler):
@@ -483,16 +793,19 @@ class TMSHandler(tornado.web.RequestHandler):
         self.headers = self.request.headers
 
     async def get(self, name, z, x, y, retina):
-        try:
-            res = await draw_tile(
-                name, int(z), int(x), int(y), bool(retina), self.request.headers)
-        except tornado.httpclient.HTTPError as ex:
-            if ex.code == 404:
-                raise tornado.web.HTTPError(404)
-            else:
-                raise
-        except KeyError:
+        if name not in APIS:
             raise tornado.web.HTTPError(404)
+        try:
+            client_headers = {
+                k:v for k,v in self.request.headers.items()
+                if k in HEADERS_WHITELIST
+            }
+            res = await draw_tile(
+                name, int(z), int(x), int(y), bool(retina), client_headers)
+        #except tornado.httpclient.HTTPError as ex:
+            # raise tornado.web.HTTPError(502)
+        #except KeyError:
+            #raise tornado.web.HTTPError(404)
         except Exception:
             raise
         if not res[0]:

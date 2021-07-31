@@ -3,7 +3,7 @@
 
 This TMS proxy solves the problems that map services in China geneally have distorted coordinates. It stitches the upstream tiles to make standard EPSG:3857 tiles. This proxy also caches tile images.
 
-Supports: Baidu, Tencent, Gaode, Google, GeoQ, Tianditu, and OpenStreetMap.
+Supports: Baidu, Tencent, Gaode, Google, GeoQ, Tianditu, OpenStreetMap and ArcGIS MapServer.
 
 Edit `tmsapi.ini` to set listen address, port, cache size, and upstream APIs.
 
