@@ -16,8 +16,8 @@ import collections
 import configparser
 import collections.abc
 import concurrent.futures
-import pycurl
 
+import pycurl
 import prcoords
 import tornado.web
 import tornado.gen
@@ -318,6 +318,7 @@ class ArcGISMapServerProvider(TileProvider):
         d = json.loads(response.body.decode('utf-8', errors='ignore'))
         if not d.get('singleFusedMapCache'):
             raise ValueError("Not tiled map")
+        client.close()
         tile_info = d['tileInfo']
         spref = tile_info.get('spatialReference', {})
         srid = spref.get('latestWkid', spref.get('wkid', 4326))
@@ -424,6 +425,7 @@ class TiandituTileProvider(TileProvider):
         cookies = []
         for cookie in response.headers.get_list("Set-Cookie"):
             cookies.append(cookie.rsplit(';', 1)[0].strip())
+        client.close()
         self.metadata = {'ticket': match.group(1), 'cookies': cookies}
         self.cache.set_meta(self.name, self.metadata)
         return self.metadata['cookies']
@@ -605,6 +607,7 @@ def stitch_tiles(tiles, corners, bbox, grid, sgnxy, name):
         if orig_format == 'PNG':
             mime_type = 'image/png'
     retim.close()
+    del retim
     return retb.getvalue(), mime_type
 
 async def get_tile(source, z, x, y, retina=False, client_headers=None):
@@ -639,13 +642,16 @@ async def get_tile(source, z, x, y, retina=False, client_headers=None):
         except tornado.httpclient.HTTPClientError as ex:
             if ex.code == 404:
                 return (None, None)
-            elif ex.code >= 500:
+            elif 400 <= ex.code < 500:
                 raise
-            elif api.retry_on_error:
+            elif api.retry_on_error or ex.code == 503:
                 if api.has_metadata:
                     req_headers.update(await api.check_metadata(req_headers, True))
                 response = await HTTP_CLIENT.fetch(url, **client_kwargs)
+            elif ex.code >= 500:
+                raise
         res = (response.body, response.headers['Content-Type'])
+        del response
         if realtime:
             TILE_SOURCE_CACHE.save(
                 cache_key, res, CONFIG.get('cache_realtime_ttl', 0))
@@ -732,9 +738,11 @@ async def draw_tile(source, z, x, y, retina=False, client_headers=None):
             futures.append(get_tile(
                 source, realz, x1[1], y1[1], retina, client_headers))
         tiles = await tornado.gen.multi(futures)
+        del futures
         ioloop = tornado.ioloop.IOLoop.current()
         result = await ioloop.run_in_executor(None, stitch_tiles,
             tiles, corners, bbox, grid, sgnxy, source)
+        del tiles, corners, bbox, grid
         return result
 
 
