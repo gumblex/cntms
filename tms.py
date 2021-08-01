@@ -318,7 +318,6 @@ class ArcGISMapServerProvider(TileProvider):
         d = json.loads(response.body.decode('utf-8', errors='ignore'))
         if not d.get('singleFusedMapCache'):
             raise ValueError("Not tiled map")
-        client.close()
         tile_info = d['tileInfo']
         spref = tile_info.get('spatialReference', {})
         srid = spref.get('latestWkid', spref.get('wkid', 4326))
@@ -425,7 +424,6 @@ class TiandituTileProvider(TileProvider):
         cookies = []
         for cookie in response.headers.get_list("Set-Cookie"):
             cookies.append(cookie.rsplit(';', 1)[0].strip())
-        client.close()
         self.metadata = {'ticket': match.group(1), 'cookies': cookies}
         self.cache.set_meta(self.name, self.metadata)
         return self.metadata['cookies']
