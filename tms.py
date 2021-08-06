@@ -295,7 +295,9 @@ class ArcGISMapServerProvider(TileProvider):
         self.metadata_lock = tornado.locks.Lock()
 
     def fast_offset_check(self, z):
-        return False
+        if not self.metadata or not self.no_offset:
+            return False
+        return bool(self.metadata.get('no_offset'))
 
     async def get_metadata(self, headers=None, no_cache=False):
         if not no_cache:

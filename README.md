@@ -9,6 +9,8 @@ Edit `tmsapi.ini` to set listen address, port, cache size, and upstream APIs.
 
 Use this software at your own risk.
 
+You can use [leaflet.ChineseCRS](https://github.com/gumblex/leaflet.ChineseCRS) on Leaflet web maps without this proxy.
+
 ---
 
 纠偏[瓦片地图](https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames)代理，可修复图块中 GCJ02、BD09 等坐标系的偏移。可用于 GIS 软件、网页地图等。
