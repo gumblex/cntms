@@ -63,7 +63,7 @@ def from4326_to3857(lon, lat):
     y = math.asinh(math.tan(math.radians(lat))) * 6378137
     return (x, y)
 
-class TileCache(collections.abc.MutableMapping):
+class DBTileCache(collections.abc.MutableMapping):
 
     def __init__(self, filename, maxsize, ttl):
         self.maxsize = maxsize
@@ -139,6 +139,74 @@ class TileCache(collections.abc.MutableMapping):
 
     def clear(self):
         self.db.execute('DELETE FROM cache')
+
+    def get(self, key, default=None):
+        try:
+            return self.__getitem__(key)
+        except KeyError:
+            return default
+
+class MemoryTileCache(collections.abc.MutableMapping):
+
+    def __init__(self, maxsize, ttl):
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self.cache = collections.OrderedDict()
+        self.metadata = {}
+
+    def __contains__(self, key):
+        if key not in self.cache:
+            return False
+        return self.cache[key][0] >= time.time()
+
+    def __getitem__(self, key):
+        row = self.cache[key]
+        if row[0] < time.time():
+            del self.cache[key]
+            raise KeyError(key)
+        return row[1:]
+
+    def save(self, key, value, ttl=None):
+        if ttl is None:
+            ttl = self.ttl
+        now = int(time.time())
+        self.cache[key] = (now+ttl, value[0], value[1])
+        self.expire()
+
+    def set_meta(self, key, value):
+        self.metadata[key] = value
+
+    def get_meta(self, key):
+        return self.metadata.get(key)
+
+    def __setitem__(self, key, value):
+        self.save(key, value)
+
+    def __delitem__(self, key):
+        del self.cache[key]
+
+    def __iter__(self):
+        return iter(self.cache)
+
+    def __len__(self):
+        return len(self.cache)
+
+    def expire(self, etime=None):
+        """Remove expired items from the cache."""
+        orig_len = len(self.cache)
+        if orig_len < self.maxsize:
+            return
+        keys = tuple(self.cache.keys())
+        i = 0
+        now = time.time()
+        while (i < orig_len and (
+            self.cache[keys[i]][0] < now or len(self.cache) > self.maxsize
+        )):
+            self.cache.popitem(last=False)
+            i += 1
+
+    def clear(self):
+        self.cache.clear()
 
     def get(self, key, default=None):
         try:
@@ -513,8 +581,11 @@ def load_config():
     if 'proxy_port' in cfg:
         cfg['proxy_port'] = int(cfg['proxy_port'])
     CONFIG = cfg
-    TILE_SOURCE_CACHE = TileCache(
-        cfg['cache_db'], cfg['cache_size'], cfg['cache_ttl'])
+    if cfg.get('cache_db'):
+        TILE_SOURCE_CACHE = DBTileCache(
+            cfg['cache_db'], cfg['cache_size'], cfg['cache_ttl'])
+    else:
+        TILE_SOURCE_CACHE = MemoryTileCache(cfg['cache_size'], cfg['cache_ttl'])
     APIS = collections.OrderedDict()
     for name, cfgsection in config.items():
         if name in ('DEFAULT', 'CONFIG'):
