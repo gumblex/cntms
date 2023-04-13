@@ -24,6 +24,7 @@ import tornado.gen
 import tornado.locks
 import tornado.ioloop
 import tornado.httpclient
+import tornado.httpserver
 import tornado.curl_httpclient
 from PIL import Image
 
@@ -40,7 +41,8 @@ R_EARTH = 6371000
 RES_3857 = 40075016.685578486153
 ORIGIN_3857 = 20037508.342789243077
 
-CONFIG_FILE = 'tmsapi.ini'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, 'tmsapi.ini')
 CONFIG = {}
 APIS = None
 
@@ -824,8 +826,11 @@ class MainHandler(tornado.web.RequestHandler):
             '</head><body><h1>TMS Tile Proxy Server</h1>'
             '<h2><a href="/map">Demo</a></h2>'
             '<h2>Endpoints</h2><dl>%s</dl></body></html>'
-        ) % ''.join('<dt>%s</dt><dd>/%s/{z}/{x}/{y}%s</dd>' % (
-            APIS[s].get('name', s), s, '{@2x}' if 'url2x' in APIS[s] else ''
+        ) % ''.join('<dt>%s</dt><dd>%s://%s/%s/{z}/{x}/{y}%s</dd>' % (
+            APIS[s].get('name', s),
+            self.request.protocol,
+            self.request.host,
+            s, '{@2x}' if 'url2x' in APIS[s] else ''
         ) for s in APIS)
         self.write(html)
 
@@ -863,7 +868,7 @@ class DemoHandler(tornado.web.RequestHandler):
             else:
                 layers_base.append(obj)
         layers_attr = json.dumps([layers_base, layers_overlay], separators=(',', ':'))
-        with open('demo.html', 'r', encoding='utf-8') as f:
+        with open(os.path.join(BASE_DIR, 'demo.html'), 'r', encoding='utf-8') as f:
             html = f.read().replace('{{layers}}', layers_attr)
         self.write(html)
 
@@ -909,7 +914,8 @@ def make_app():
 
 if __name__ == '__main__':
     app = make_app()
-    app.listen(CONFIG['port'], CONFIG['listen'])
+    http_server = tornado.httpserver.HTTPServer(app, xheaders=True)
+    http_server.listen(CONFIG['port'], CONFIG['listen'])
     ioloop = tornado.ioloop.IOLoop.current()
     ioloop.set_default_executor(
         concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()))
